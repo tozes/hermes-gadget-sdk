@@ -35,9 +35,12 @@ platforms:
       unauthorized_dm_behavior: pair
       # heartbeat_s: 20
       # max_utterance_s: 60
+      # battery_log: true      # keep each device's battery readings in a CSV (see below)
       # tls_cert: /path/cert.pem   # serve wss://
       # tls_key: /path/key.pem
 ```
+
+`battery_log: true` writes each device's battery readings to `<hermes home>/plugin-data/gadget/battery/<device id>.csv`: a row every 30 seconds, and at once when the power source changes, with the time, `battery_mv`, `battery_percent`, `charging`, `external_power` and `battery_present`. Devices that report no battery voltage or percentage add nothing. A file that reaches 8 MB moves to `<device id>.1.csv`, replacing the previous one. Use a log of a full discharge, from a full charge to shutdown with USB unplugged, to check or fit a board's voltage-to-percent estimate. It is off by default and the gateway needs a restart after changing it.
 
 Secrets go in `~/.hermes/.env`, following Hermes's rule that `.env` is only for secrets:
 
@@ -83,6 +86,7 @@ After the restart, run `hermes gadget info` and use the new URL to update each d
 | Images from the agent | `send_image_file()` / `send_image()` | Converted to RGB565 to fit the screen (needs Pillow) |
 | Confirmations (`/new`, `/undo`, model switches) | `send_slash_confirm()` + `tools.slash_confirm.resolve()` | Shown as a `prompt`; TALK resolves `once`, CANCEL `cancel`. The handler's reply goes back with `send()` |
 | Dangerous-command approvals | `_send_exec_approval_prompt(ExecApprovalPrompt)` + `tools.approval.resolve_gateway_approval()` | Shown as a `prompt`; TALK resolves `once`, CANCEL `deny`. On timeout Hermes calls `edit_message()` on the prompt, which withdraws it |
+| Agent questions (the `clarify` tool) | `send_clarify()` | Hermes's text fallback (the question with numbered choices; the next message, spoken or typed, is the answer), also spoken with Hermes's text-to-speech when the device speaks replies. The device has no multiple-choice prompt |
 | Pairing | Hermes DM pairing (`gateway/pairing.py`, `hermes pairing approve`; `hermes gadget pair` approves through the same `PairingStore`) | See below |
 | Authorization state | `BasePlatformAdapter._is_sender_authorized()` | The runner-installed check; used to mirror approval and revocation to the device |
 | Agent tools | `ctx.register_tool(toolset="gadget")` | Part of the implicit `hermes-gadget` toolset; also usable from other chats |

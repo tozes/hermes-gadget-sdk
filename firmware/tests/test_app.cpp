@@ -20,6 +20,12 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
   // System
   uint32_t clock = 1000;
   uint32_t now_ms() override { return clock; }
+  bool dozing = false;
+  int doze_changes = 0;
+  void set_dozing(bool d) override {
+    dozing = d;
+    ++doze_changes;
+  }
   void random_bytes(uint8_t* out, size_t len) override {
     for (size_t i = 0; i < len; ++i) out[i] = static_cast<uint8_t>(i);
   }
@@ -55,6 +61,7 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
   }
   bool set(std::string_view key, std::string_view value) override {
     if (storage_full) return false;
+    if (key.empty() || key.size() > 15) return false;  // NVS refuses longer keys, as the ESP32 port does
     kv[std::string(key)] = std::string(value);
     return true;
   }
@@ -63,6 +70,7 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
   // Display
   int width = 320, height = 240;
   bool round = false;
+  bool emissive = false;
   bool backlight = false;
   int brightness = 0, volume = 0;
   std::vector<uint16_t> fb = std::vector<uint16_t>(320 * 240, 0);
@@ -73,6 +81,7 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
     d.width = static_cast<uint16_t>(width);
     d.height = static_cast<uint16_t>(height);
     d.round = round;
+    d.emissive = emissive;
     d.has_backlight = backlight;
     return d;
   }
@@ -82,7 +91,11 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
     fb.assign(static_cast<size_t>(diameter * diameter), 0);
   }
   uint16_t* framebuffer() override { return fb.data(); }
-  void set_backlight(uint8_t percent) override { brightness = percent; }
+  bool lit_while_dozing = false;  // the screen was turned on before the port woke
+  void set_backlight(uint8_t percent) override {
+    brightness = percent;
+    if (percent && dozing) lit_while_dozing = true;
+  }
   void flush(uint16_t y0, uint16_t y1) override {
     ++flushes;
     flushed_rows += y1 - y0;
@@ -1222,6 +1235,232 @@ TEST("power: idle screen dims, sleeps and consumes the wake input without record
   CHECK_EQ(r.fake.brightness, 100);
 }
 
+namespace {
+// A PMIC whose power key the board can only see as short presses.
+struct KeyPower : hg::Power {
+  int presses = 0;
+  std::optional<bool> usb = false;  // on battery unless a test plugs it in
+  std::optional<bool> external_power() override { return usb; }
+  std::optional<hg::PowerStatus> read() override { return hg::PowerStatus{true, 3900, 70, false, false}; }
+  bool power_off() override { return true; }
+  bool take_key_press() override {
+    if (!presses) return false;
+    --presses;
+    return true;
+  }
+};
+}  // namespace
+
+TEST("power: the power key turns the screen off and back on, without a screen timeout") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  CHECK_EQ(r.fake.brightness, 100);
+  key.presses = 1;
+  r.advance(100);
+  CHECK_EQ(r.fake.brightness, 0);
+  for (int i = 0; i < 4; ++i) {  // a minute with the server alive
+    r.server(R"({"type":"ping"})");
+    r.advance(15000);
+  }
+  CHECK_EQ(r.fake.brightness, 0);  // stays off: no timeout brings it back
+  key.presses = 1;
+  r.advance(100);
+  CHECK_EQ(r.fake.brightness, 100);
+  for (int i = 0; i < 4; ++i) {
+    r.server(R"({"type":"ping"})");
+    r.advance(15000);
+  }
+  CHECK_EQ(r.fake.brightness, 100);  // and stays on
+}
+
+TEST("power: other input wakes a screen the power key turned off, and only wakes it") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  key.presses = 1;
+  r.advance(100);
+  CHECK_EQ(r.fake.brightness, 0);
+  r.app.on_button(hg::Button::Talk, true);
+  CHECK_EQ(r.fake.brightness, 100);
+  CHECK(!r.fake.mic_on);
+  r.app.on_button(hg::Button::Talk, false);
+  CHECK(r.fake.last("audio.start") == nullptr);
+}
+
+TEST("power: a prompt turns a screen the power key turned off back on") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  key.presses = 1;
+  r.advance(100);
+  CHECK_EQ(r.fake.brightness, 0);
+  r.server(R"({"type":"prompt","id":"wake","text":"Continue?"})");
+  CHECK_EQ(r.fake.brightness, 100);
+  CHECK(r.app.screen() == hg::Screen::Prompt);
+}
+
+TEST("power: a dark screen stays dark while the connection drops and comes back") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  key.presses = 1;
+  r.advance(100);
+  CHECK_EQ(r.fake.brightness, 0);
+  r.app.on_transport_closed("gone");
+  r.advance(5000);
+  CHECK_EQ(r.fake.brightness, 0);  // reconnecting in the dark (a commute must not light it)
+  r.app.on_network(false, "Wi-Fi lost");
+  r.app.on_network(true, "192.168.1.146");
+  r.advance(5000);
+  CHECK_EQ(r.fake.brightness, 0);
+  r.app.on_button(hg::Button::Talk, true);  // the user still wakes it
+  CHECK_EQ(r.fake.brightness, 100);
+  r.app.on_button(hg::Button::Talk, false);
+}
+
+TEST("power: a lit screen stays lit while reconnecting, as before") {
+  Rig r;
+  r.fake.backlight = true;
+  r.bring_online(true);
+  CHECK_EQ(r.app.console("set screen_timeout 30"), std::string("@ok screen_timeout"));
+  r.app.on_transport_closed("gone");
+  r.advance(60000);  // reconnect attempts fail: still not settled
+  CHECK_EQ(r.fake.brightness, 100);
+}
+
+TEST("power: the power key brings a dimmed screen back to full brightness") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  CHECK_EQ(r.app.console("set screen_timeout 30"), std::string("@ok screen_timeout"));
+  r.advance(15000);
+  CHECK_EQ(r.fake.brightness, 10);
+  key.presses = 1;
+  r.advance(100);
+  CHECK_EQ(r.fake.brightness, 100);
+}
+
+TEST("doze: a dark, idle screen on battery dozes; any input ends it before drawing") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  r.advance(1000);
+  CHECK(!r.fake.dozing);  // the screen is on
+  key.presses = 1;
+  r.advance(200);
+  CHECK_EQ(r.fake.brightness, 0);
+  CHECK(r.fake.dozing);
+  CHECK(r.app.dozing());
+  r.app.on_button(hg::Button::Talk, true);
+  CHECK(!r.fake.dozing);
+  CHECK_EQ(r.fake.brightness, 100);
+  CHECK(!r.fake.lit_while_dozing);
+  r.app.on_button(hg::Button::Talk, false);
+}
+
+TEST("doze: external power never dozes, and plugging in ends a doze within 100 ms") {
+  KeyPower key;
+  key.usb = true;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  key.presses = 1;
+  r.advance(1000);
+  CHECK_EQ(r.fake.brightness, 0);
+  CHECK(!r.fake.dozing);  // dark but plugged in: USB debugging keeps working
+  key.usb = false;
+  r.advance(200);
+  CHECK(r.fake.dozing);
+  key.usb = true;
+  r.advance(100);
+  CHECK(!r.fake.dozing);
+  CHECK_EQ(r.fake.brightness, 0);  // the screen stays off; only the doze ends
+}
+
+TEST("doze: an unknown power source counts as plugged in") {
+  KeyPower key;
+  key.usb = std::nullopt;  // the PMIC didn't answer
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  key.presses = 1;
+  r.advance(1000);
+  CHECK_EQ(r.fake.brightness, 0);
+  CHECK(!r.fake.dozing);
+  CHECK_EQ(r.fake.doze_changes, 0);
+}
+
+TEST("doze: a prompt or a lost connection ends it; Screen timeout dozes too") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  key.presses = 1;
+  r.advance(200);
+  CHECK(r.fake.dozing);
+  r.server(R"({"type":"prompt","id":"wake","text":"Continue?"})");
+  r.advance(10);
+  CHECK(!r.fake.dozing);
+  r.app.console("no");
+  CHECK_EQ(r.app.console("set screen_timeout 30"), std::string("@ok screen_timeout"));
+  r.server(R"({"type":"ping"})");
+  r.advance(25000);
+  r.server(R"({"type":"ping"})");
+  r.advance(10000);
+  CHECK_EQ(r.fake.brightness, 0);
+  CHECK(r.fake.dozing);
+  r.app.on_transport_closed("gone");
+  r.advance(10);
+  CHECK(!r.fake.dozing);
+}
+
+TEST("doze: without Wi-Fi it keeps dozing between join attempts; reconnecting to Hermes is awake") {
+  KeyPower key;
+  Rig r;
+  r.fake.backlight = true;
+  r.hal.power = &key;
+  r.bring_online(true);
+  key.presses = 1;
+  r.advance(200);
+  CHECK(r.fake.dozing);
+  r.app.on_network(false, "Wi-Fi lost (reason 200)");
+  r.advance(60000);
+  CHECK(r.fake.dozing);  // the port wakes the chip for each attempt
+  CHECK_EQ(r.fake.brightness, 0);
+  r.app.on_network(true, "192.168.1.146");
+  r.advance(1500);  // Wi-Fi is back: reconnecting to Hermes
+  CHECK(!r.fake.dozing);
+}
+
+TEST("doze: boards without a power reading never doze") {
+  Rig r;
+  r.fake.backlight = true;
+  r.bring_online(true);
+  CHECK_EQ(r.app.console("set screen_timeout 30"), std::string("@ok screen_timeout"));
+  r.server(R"({"type":"ping"})");
+  r.advance(25000);
+  r.server(R"({"type":"ping"})");
+  r.advance(10000);
+  CHECK_EQ(r.fake.brightness, 0);
+  CHECK(!r.fake.dozing);
+}
+
 TEST("power: an idle settings menu sleeps on every view; the wake input restores it where it was") {
   Rig r;
   r.fake.backlight = true;
@@ -1298,6 +1537,171 @@ TEST("power: failed readings replace stale data and shutdown requires a second l
   CHECK_EQ(battery.shutdowns, 0);
   r.app.console("talk"); r.app.console("release");
   CHECK_EQ(battery.shutdowns, 1);
+}
+
+TEST("battery indicator: the top band shows the level, colours charging and low, and hides without a reading") {
+  for (bool round : {false, true}) {
+    FakeHal display;
+    if (round) display.make_round(466);
+    hg::Ui ui(display);
+    const int w = display.width;
+    const int y0 = 0, y1 = round ? 68 : 22;  // round: the panel above the UI square; else the top bar
+    const auto top = [&] {
+      return std::vector<uint16_t>(display.fb.begin() + y0 * w, display.fb.begin() + y1 * w);
+    };
+    const auto count = [&](uint16_t color) {
+      int n = 0;
+      for (uint16_t px : top()) n += px == color;
+      return n;
+    };
+    hg::UiModel m;
+    m.screen = hg::Screen::Ready;
+    m.link = hg::Link::Network;  // a yellow dot, so red and green below come from the battery
+    ui.render(m);
+    const auto none = top();
+    const uint16_t red = hg::rgb565(242, 95, 92), green = hg::rgb565(61, 214, 140);
+    m.battery = 65;
+    ui.render(m);
+    CHECK(top() != none);
+    CHECK_EQ(count(red), 0);
+    CHECK_EQ(count(green), 0);
+    m.battery = 8;
+    m.battery_low = true;
+    ui.render(m);
+    CHECK(count(red) > 0);  // low: red fill and text
+    CHECK_EQ(count(green), 0);
+    m.battery_charging = true;
+    ui.render(m);
+    CHECK(count(green) > 0);  // charging: green fill, and the text is no longer red
+    CHECK_EQ(count(red), 0);
+    // Percentage only: no icon, so charging turns the text green instead.
+    m.battery_icon = false;
+    ui.render(m);
+    CHECK(count(green) > 0);
+    const auto text_only = top();
+    m.battery_icon = true;
+    m.battery_text = false;
+    ui.render(m);
+    CHECK(top() != text_only);
+    CHECK(count(green) > 0);  // icon only: the fill
+    m.battery_text = true;
+    m.battery = -1;
+    m.battery_low = m.battery_charging = false;
+    ui.render(m);
+    CHECK(top() == none);
+    if (round) {
+      // Centred near the top edge, every lit pixel inside the circle.
+      m.battery = 100;
+      ui.render(m);
+      int min_x = w, max_x = 0, min_y = y1;
+      for (int y = 0; y < y1; ++y)
+        for (int x = 0; x < w; ++x)
+          if (display.fb[static_cast<size_t>(y * w + x)] != none[static_cast<size_t>(y * w + x)]) {
+            min_x = std::min(min_x, x); max_x = std::max(max_x, x); min_y = std::min(min_y, y);
+            const int dx = 2 * x + 1 - w, dy = 2 * y + 1 - w;
+            CHECK(dx * dx + dy * dy < w * w);
+          }
+      CHECK(std::abs((min_x + max_x) / 2 - w / 2) <= 2);
+      CHECK(min_y < 20);
+    }
+  }
+}
+
+TEST("display: an emissive panel leaves its background unlit; a backlit one keeps near black") {
+  for (bool emissive : {false, true}) {
+    FakeHal display;
+    display.make_round(466);
+    display.emissive = emissive;
+    hg::Ui ui(display);
+    hg::UiModel m;
+    m.screen = hg::Screen::Ready;
+    m.hero = true;
+    ui.render(m);
+    const uint16_t corner = display.fb[0], centre_edge = display.fb[static_cast<size_t>(233 * 466 + 120)];
+    CHECK_EQ(corner == 0, emissive);  // outside the UI square
+    CHECK_EQ(centre_edge == 0, emissive);  // inside it, beside the mascot
+  }
+}
+
+TEST("battery indicator: off by default, follows readings once chosen, and each select picks the next style") {
+  struct Battery : hg::Power {
+    hg::PowerStatus status{true, 3850, 65, false, false};
+    std::optional<hg::PowerStatus> read() override { return status; }
+    bool power_off() override { return true; }
+  } battery;
+  Rig r;
+  r.hal.power = &battery;
+  r.bring_online(true);
+  CHECK_EQ(int(r.app.model().battery), -1);  // off until the user picks a style
+  CHECK(r.fake.kv.find("battery_display") == r.fake.kv.end());
+  CHECK_EQ(r.app.console("set battery_display both"), std::string("@ok battery_display"));
+  CHECK_EQ(int(r.app.model().battery), 65);
+  CHECK(r.app.model().battery_icon && r.app.model().battery_text);
+  CHECK(!r.app.model().battery_low);
+  battery.status = hg::PowerStatus{true, 3400, 7, false, false};
+  r.advance(5000);
+  CHECK_EQ(int(r.app.model().battery), 7);
+  CHECK(r.app.model().battery_low);
+  battery.status = hg::PowerStatus{true, 3400, 7, true, true};  // on USB and charging: no longer low
+  r.advance(5000);
+  CHECK(r.app.model().battery_charging);
+  CHECK(!r.app.model().battery_low);
+  battery.status = hg::PowerStatus{false, std::nullopt, 0, false, true};  // no battery fitted
+  r.advance(5000);
+  CHECK_EQ(int(r.app.model().battery), -1);
+  battery.status = hg::PowerStatus{true, 3850, 65, false, false};
+  r.advance(5000);
+  CHECK_EQ(int(r.app.model().battery), 65);
+  CHECK_EQ(r.app.console("set battery_display maybe"),
+           std::string("@error battery_display must be icon, percentage, both or off"));
+  CHECK_EQ(r.app.console("set battery_display off"), std::string("@ok battery_display"));
+  CHECK_EQ(r.fake.kv["battery_display"], std::string("off"));
+  CHECK_EQ(int(r.app.model().battery), -1);
+  // Each select on the battery page moves to the next style, saves it, and stays on the page.
+  r.app.open_settings();
+  for (int i = 0; i < 8; ++i) r.app.console("cancel");
+  CHECK_EQ(r.app.model().detail, std::string("Battery and power"));
+  CHECK(r.app.model().body.find("Indicator: Off\nTALK to change") != std::string::npos);  // a button board
+  struct Step { const char* saved; const char* shown; bool icon, text; };
+  for (const Step& step : {Step{"icon", "Icon", true, false}, Step{"percentage", "Percent", false, true},
+                           Step{"both", "Both", true, true}, Step{"off", "Off", true, true},
+                           Step{"icon", "Icon", true, false}}) {
+    r.app.console("talk"); r.app.console("release");
+    CHECK_EQ(r.fake.kv["battery_display"], std::string(step.saved));
+    CHECK(r.app.model().body.find(std::string("Indicator: ") + step.shown + "\n") != std::string::npos);
+    CHECK_EQ(r.app.model().detail, std::string("Battery and power"));
+    CHECK_EQ(int(r.app.model().battery), std::string(step.saved) == "off" ? -1 : 65);
+    CHECK_EQ(r.app.model().battery_icon, step.icon);
+    CHECK_EQ(r.app.model().battery_text, step.text);
+  }
+  r.app.console("settings close");
+  r.app.console("set battery_display both");
+  CHECK_EQ(int(r.app.model().battery), 65);
+}
+
+TEST("battery indicator: touch screens say tap") {
+  struct Battery : hg::Power {
+    std::optional<hg::PowerStatus> read() override { return hg::PowerStatus{true, 3850, 65, false, false}; }
+    bool power_off() override { return true; }
+  } battery;
+  Rig r(Rig::touch_profile());
+  r.hal.power = &battery;
+  r.bring_online(true);
+  r.app.open_settings();
+  for (int i = 0; i < 8; ++i) r.app.console("cancel");
+  CHECK_EQ(r.app.model().detail, std::string("Battery and power"));
+  CHECK(r.app.model().body.find("Indicator: Off\nTap to change") != std::string::npos);
+}
+
+TEST("battery indicator: boards without a power driver have no battery page") {
+  Rig r;
+  r.bring_online(true);
+  r.app.open_settings();
+  for (int i = 0; i < 20; ++i) {
+    CHECK(r.app.model().detail != "Battery and power");
+    r.app.console("cancel");
+  }
+  CHECK_EQ(int(r.app.model().battery), -1);
 }
 
 TEST("power: a peripheral rail cannot be selected as device power-off") {

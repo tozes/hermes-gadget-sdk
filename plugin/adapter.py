@@ -27,8 +27,10 @@ Secrets (``~/.hermes/.env``): ``GADGET_ACCESS_TOKEN`` (optional shared token).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import re
 import ssl
 import time
@@ -52,6 +54,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 
 from . import audio as gaudio
 from . import imaging, ota, runtime, textfmt
+from .battery_log import BatteryLog
 from .hub import DeviceHub, DeviceSession, HubDelegate
 from .store import DeviceStore
 
@@ -111,6 +114,16 @@ class _Prompt:
         return self.kind == "slash" and time.monotonic() - self.created > SLASH_CONFIRM_TTL_S
 
 
+def spoken_question(question: str, choices: Optional[list]) -> str:
+    """A clarify question as it is read aloud: the question, then its choices by number."""
+    text = (question or "").strip()
+    picks = [str(c).strip() for c in choices or [] if str(c).strip()]
+    if picks:
+        listed = " ".join(f"{i}: {c.rstrip('.')}." for i, c in enumerate(picks, start=1))
+        text = f"{text} The choices are {listed} Say the number or your own answer."
+    return text
+
+
 def transcript_echo(content: str) -> Optional[str]:
     """The transcript, if ``content`` is the gateway's echo line in Hermes's active language."""
     line = t(_ECHO_KEY, text=_ECHO_SLOT)
@@ -147,6 +160,8 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
         self._max_utterance_s = float(extra.get("max_utterance_s") or 60)
         self._speak_replies = _flag(extra.get("speak_replies"), True)
         self._auto_home = _flag(extra.get("auto_home"), True)
+        self._battery_log_on = _flag(extra.get("battery_log"), False)
+        self._battery_log: Optional[BatteryLog] = None
         self._tls_cert = extra.get("tls_cert")
         self._tls_key = extra.get("tls_key")
         self._access_token = extra_or_secret(extra, "access_token", "GADGET_ACCESS_TOKEN") or None
@@ -174,6 +189,8 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
         from plugins.plugin_storage import plugin_data_dir
 
         self._store = DeviceStore(plugin_data_dir(PLATFORM_NAME))
+        if self._battery_log_on:
+            self._battery_log = BatteryLog(plugin_data_dir(PLATFORM_NAME) / "battery")
         try:
             ssl_ctx = self._ssl_context()
         except (OSError, ssl.SSLError) as exc:
@@ -397,6 +414,14 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
             session, f"ev-{uuid.uuid4().hex[:6]}", f"[Gadget event] {name} {payload}".strip(),
             message_type=MessageType.TEXT, allow_gateway_control=False))
 
+    async def on_state(self, session: DeviceSession, sensors: dict) -> None:
+        if not self._battery_log:
+            return
+        try:
+            self._battery_log.record(session.device_id, sensors)
+        except OSError as exc:
+            logger.warning("gadget: could not write the battery log for %s: %s", session.device_id, exc)
+
     async def on_disconnect(self, session: DeviceSession) -> None:
         if self._hub and session.device_id not in self._hub.sessions:
             self._turns.pop(session.device_id, None)
@@ -573,6 +598,40 @@ class GadgetAdapter(BasePlatformAdapter, HubDelegate):
             await self.send(session.device_id, result)
         else:
             await session.send_notice("That question has expired")
+
+    async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+                           session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+        """A question from the agent (Hermes's clarify tool). The device shows only yes/no prompts,
+        so the question goes out as Hermes's own text (numbered choices; the next message, spoken
+        or typed, is the answer) and, on a device that speaks replies, is also spoken: otherwise a
+        voice user hears nothing while the agent waits."""
+        result = await super().send_clarify(chat_id=chat_id, question=question, choices=choices,
+                                            clarify_id=clarify_id, session_key=session_key, metadata=metadata)
+        session = self._session(chat_id)
+        if result.success and session is not None and session.paired and self._should_auto_tts_for_chat(chat_id):
+            session.spawn(self._speak(chat_id, spoken_question(question, choices)))
+        return result
+
+    async def _speak(self, chat_id: str, text: str) -> None:
+        """Speak ``text`` on the device with Hermes's configured text-to-speech."""
+        paths: List[str] = []
+        try:
+            from tools.tts_tool import text_to_speech_tool
+
+            raw = await asyncio.to_thread(text_to_speech_tool, text=text)
+            result = json.loads(raw) if raw else {}
+            paths = [str(p) for p in (result.get("file_paths") or [result.get("file_path")]) if p]
+            if not result.get("success") or not paths:
+                logger.warning("[%s] could not speak a question: %s", self.name, result.get("error"))
+                return
+            for path in paths:
+                await self._play_file(chat_id, path)
+        except Exception as exc:  # TTS unavailable or misconfigured: the text still went out
+            logger.warning("[%s] could not speak a question: %s", self.name, exc)
+        finally:
+            for path in paths:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         session = self._session(chat_id)

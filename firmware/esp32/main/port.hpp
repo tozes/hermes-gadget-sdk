@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <mutex>
 #include <string>
@@ -22,6 +23,8 @@
 #include "shared_reply.hpp"
 #include "speaker_pa.hpp"
 #include "tag_scanner.hpp"
+#include "wifi_retry.hpp"
+#include "ws_link.hpp"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
 #include "esp_codec_dev.h"
@@ -33,6 +36,7 @@
 #include "esp_lcd_types.h"
 #include "esp_lcd_touch.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "esp_websocket_client.h"
 #include "esp_http_server.h"
 #include "freertos/semphr.h"
@@ -101,6 +105,18 @@ class EspSystem final : public hg::System {
   uint32_t now_ms() override;
   void random_bytes(uint8_t* out, size_t len) override;
   void log(hg::LogLevel level, std::string_view message) override;
+  // Boards with BoardConfig::light_sleep: keeps the chip out of light sleep
+  // except while dozing. Call before power management enables light sleep.
+  bool enable_doze();
+  void set_dozing(bool dozing) override;
+  static bool dozing_now();  // for tasks that poll: poll less while dozing
+  std::function<void()> on_doze_start;  // e.g. power the speaker down
+  std::function<void()> on_doze_end;    // e.g. power it up, retry Wi-Fi now: the user is back
+
+ private:
+  esp_pm_lock_handle_t awake_ = nullptr;  // held whenever not dozing
+  bool dozing_ = false;
+  int64_t doze_started_us_ = 0;
 };
 
 class NvsStorage final : public hg::Storage {
@@ -121,12 +137,20 @@ class WsTransport final : public hg::Transport {
   bool send_text(std::string_view text) override;
   bool send_binary(const uint8_t* data, size_t len) override;
   void close() override;
-  uint32_t generation() const { return generation_.load(); }
+  uint32_t generation() const { return gens_.current(); }
+  // True once if the current connection was lost. Backs up the WsClosed event,
+  // which the client may post from the app task itself while the queue is full.
+  bool take_lost() { return gens_.take_lost(); }
 
  private:
   static void on_event(void* arg, const char* base, int32_t id, void* data);
+  // Sends run on their own task, so a slow or dead link never stalls the app
+  // task (and with it the screen): send_*() only queue a copy.
+  static void tx_task(void* arg);
+  bool enqueue(uint8_t opcode, const void* data, size_t len);
   esp_websocket_client_handle_t client_ = nullptr;
-  std::atomic<uint32_t> generation_{0};
+  QueueHandle_t tx_ = nullptr;
+  hg::ws::Generations gens_;
   std::string url_, subprotocol_;
   std::string rx_;  // fragment reassembly (WebSocket task only)
   uint8_t rx_opcode_ = 0;
@@ -255,6 +279,7 @@ class AmoledDisplay final : public hg::Display {
   uint16_t* bounce_ = nullptr;
   SemaphoreHandle_t done_ = nullptr;
   std::optional<hg::BandFlush> bands_;
+  bool panel_on_ = true;
 };
 
 // Logs a failed ESP-IDF call. A display's begin() returns false on one, so the
@@ -298,21 +323,32 @@ class CodecAudio {
   bool begin(const CodecAudioConfig& cfg, i2c_master_bus_handle_t bus);
   esp_codec_dev_handle_t out() const { return out_; }
   esp_codec_dev_handle_t in() const { return in_; }
+  // How CodecMic powers its ADC down between captures (MicPower).
+  struct MicLink {
+    bool switchable = false;  // a recording-only codec, not shared with the speaker
+    i2s_chan_handle_t rx = nullptr;
+    esp_codec_dev_sample_info_t format = {};
+    float gain_db = 0;
+  };
+  MicLink mic_link() const { return mic_link_; }
 
  private:
   i2s_chan_handle_t tx_ = nullptr, rx_ = nullptr;
   esp_codec_dev_handle_t out_ = nullptr, in_ = nullptr;
+  MicLink mic_link_;
 };
 
 class CodecMic final : public hg::AudioIn {
  public:
-  bool begin(esp_codec_dev_handle_t dev, bool rmnm);
+  bool begin(esp_codec_dev_handle_t dev, bool rmnm, const CodecAudio::MicLink& link);
   bool start(uint32_t sample_rate) override;
   void stop() override { capturing_ = false; }
 
  private:
   static void task(void* arg);
   esp_codec_dev_handle_t dev_ = nullptr;
+  CodecAudio::MicLink link_;
+  TaskHandle_t task_ = nullptr;
   bool rmnm_ = false;
   int16_t* raw_ = nullptr;
   std::atomic<bool> capturing_{false};
@@ -327,10 +363,23 @@ class CodecSpeaker final : public hg::AudioOut {
   void abort() override;
   bool busy() const override;
   void set_volume(uint8_t percent) override;
+  // While dozing: close the DAC and its I2S channel (an enabled channel holds a
+  // power lock that keeps the chip out of light sleep). Only for a speaker codec
+  // the microphones don't share. begin() powers it back up before playing.
+  void allow_power_down(const esp_codec_dev_sample_info_t& format) {
+    format_ = format;
+    can_power_down_ = true;
+  }
+  void power_down();
+  void power_up();
 
  private:
   static void task(void* arg);
   esp_codec_dev_handle_t dev_ = nullptr;
+  esp_codec_dev_sample_info_t format_ = {};
+  bool can_power_down_ = false, powered_ = true;
+  uint8_t volume_ = 70;
+  TaskHandle_t task_ = nullptr;
   bool stereo32_ = false;
   int32_t* stereo_ = nullptr;
   std::optional<hg::SpeakerPa> pa_;  // set when this speaker, not esp_codec_dev, drives the PA pin
@@ -373,10 +422,19 @@ class AxpPower final : public hg::Power {
   bool enable_audio_supply() { return chip_ && chip_->enable_aldo1_3v3(); }
   std::optional<hg::PowerStatus> read() override { return chip_->read(); }
   bool power_off() override { return chip_->power_off(); }
+  // For boards whose PWR key reaches only the AXP2101 (BoardConfig::axp_power_key).
+  void use_power_key();
+  bool take_key_press() override { return key_ && chip_->take_key_press(); }
+  void use_curves(hg::Curve discharge, hg::Curve charge) {
+    if (chip_ && discharge) chip_->use_curves(discharge, charge);
+  }
+  std::optional<uint16_t> charge_current_ma() { return chip_ ? chip_->charge_current_ma() : std::nullopt; }
+  std::optional<bool> external_power() override { return chip_->vbus_good(); }
 
  private:
   i2c_master_dev_handle_t dev_ = nullptr;
   std::unique_ptr<hg::Axp2101> chip_;
+  bool key_ = false;
 };
 
 class CoreS3Board {
@@ -442,7 +500,9 @@ class EspUpdater final : public hg::Updater {
  private:
   static constexpr size_t kHeadBytes = 112;  // image + segment headers, then the app description up to its project name
   std::string board_;
-  hg::TagScanner board_tag_{"HGBOARD="};
+  // Searches for the first 8 bytes of board_tag(): a separate "HGBOARD=" literal
+  // here would put a nameless copy of the tag in every image, ahead of the real one.
+  hg::TagScanner board_tag_{std::string_view()};
   const void* target_ = nullptr;             // esp_partition_t
   uint32_t handle_ = 0;                      // esp_ota_handle_t
   bool open_ = false;
@@ -459,6 +519,10 @@ class Wifi {
   void disconnected();
   void connected(hg::App& app);
   void tick(hg::App& app, uint32_t now);
+  // Retry at once instead of at the next backoff slot (the user is back).
+  void retry_now();
+  // Whether the device runs on its battery: the retry backoff applies only then.
+  std::function<bool()> on_battery;
   std::string start_setup();
   void stop_setup();
   // The temporary network's credentials, for the setup screen's QR code.
@@ -474,7 +538,11 @@ class Wifi {
   bool configured_ = false;
   bool auto_setup_ = false, auto_setup_tried_ = false;
   bool joining_ = false, wait_disconnect_ = false;
-  uint32_t retry_at_ = 0, trial_at_ = 0, setup_until_ = 0, close_at_ = 0;
+  uint32_t trial_at_ = 0, setup_until_ = 0, close_at_ = 0;
+  hg::WifiRetry retry_;
+  esp_pm_lock_handle_t attempt_lock_ = nullptr;  // light sleep would stall an attempt
+  bool attempt_held_ = false;
+  void hold_while_attempting();
   hg::WifiCredentials candidate_{};
   httpd_handle_t http_ = nullptr;
   std::mutex setup_mutex_;

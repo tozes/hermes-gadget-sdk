@@ -29,6 +29,9 @@ struct DisplayInfo {
   // Extra left and right padding for the top bar's text, for a rectangular
   // panel with rounded corners.
   uint8_t corner_inset = 0;
+  // An OLED/AMOLED panel: unlit pixels draw no power, so the background is
+  // true black instead of the near-black used on backlit LCDs.
+  bool emissive = false;
 };
 
 // A full-frame RGB565 framebuffer owned by the port (PSRAM on hardware).
@@ -94,6 +97,10 @@ class System {
   virtual uint32_t now_ms() = 0;
   virtual void random_bytes(uint8_t* out, size_t len) = 0;
   virtual void log(LogLevel level, std::string_view message) = 0;
+  // Dozing: the screen is off, nothing is happening and the device runs on its
+  // battery. The port may let the chip sleep between events; input, the network
+  // and the power key still reach the app, only less often (App::kDozeWaitMs).
+  virtual void set_dozing(bool dozing) { (void)dozing; }
 };
 
 // The slot a firmware update is written to. The core authorizes and checks the
@@ -134,6 +141,11 @@ class Power {
   // Override when this controls a peripheral rail rather than device shutdown.
   virtual bool can_power_off() const { return true; }
   virtual bool power_off() = 0;
+  // True once per short press of a power key only the PMIC can see. Polled.
+  virtual bool take_key_press() { return false; }
+  // Whether external (USB) power is present right now: a cheap read, polled while
+  // the screen is off. Unknown means "assume plugged in", which never dozes.
+  virtual std::optional<bool> external_power() { return std::nullopt; }
 };
 
 // Everything except `system` and `transport` may be null when the board lacks it.
