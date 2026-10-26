@@ -50,6 +50,7 @@ idf_component_register(
         "../../drivers/pcf85063.cpp"
         "../../drivers/qmi8658.cpp"
         "port_storage.cpp"
+        "port_tailnet.cpp"
         "port_system.cpp"
         "port_time.cpp"
         "port_touch.cpp"
@@ -83,4 +84,6 @@ idf_component_register(
         nvs_flash
         mbedtls
         esp_websocket_client
+        # Empty unless CONFIG_HG_TAILNET (components/tailtiny).
+        tailtiny
 )
