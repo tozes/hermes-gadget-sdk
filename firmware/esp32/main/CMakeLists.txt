@@ -108,3 +108,13 @@ idf_component_register(
 # port_wake.cpp .incbin's the models from here (EMBED_FILES can't follow the
 # sdkconfig under PlatformIO, which needs every embedded file in platformio.ini).
 target_compile_definitions(${COMPONENT_LIB} PRIVATE "HG_WAKE_DIR=\"${CMAKE_CURRENT_LIST_DIR}/wake\"")
+if(HG_WAKE_REQUIRES)
+    # TFLM without its error and log text (MicroPrintf becomes a no-op): it has to
+    # fit the app slot's 10% margin beside one model. port_wake.cpp logs failures
+    # by return code instead.
+    idf_component_get_property(hg_tflm_lib espressif__esp-tflite-micro COMPONENT_LIB)
+    target_compile_definitions(${hg_tflm_lib} PUBLIC TF_LITE_STRIP_ERROR_STRINGS)
+    # The component builds with -O3; the last -O wins. Not -Os: CMake and
+    # PlatformIO drop it as a duplicate of the project-wide -Os before -O3.
+    target_compile_options(${hg_tflm_lib} PRIVATE -Oz)
+endif()

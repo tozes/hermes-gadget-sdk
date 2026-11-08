@@ -157,7 +157,7 @@ CONFIG_HG_WAKE_WORD=y
 CONFIG_HG_WAKE_WORD_TEST_CLIPS=y
 ```
 
-On the serial console, `wake-test hermes` or `wake-test jarvis` runs that model on its built-in synthetic clip (one second of silence without the clips) and prints the peak probability, whether the mean of the model's last five probabilities crossed its cutoff, and the time per inference. `CONFIG_HG_WAKE_WORD_HEY_HERMES` and `CONFIG_HG_WAKE_WORD_HEY_JARVIS` choose the models built in. The models and their sources are listed in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+On the serial console, `wake-test hermes` or `wake-test jarvis` runs that model on its built-in synthetic clip (one second of silence without the clips) and prints the peak probability, whether the mean of the model's last five probabilities crossed its cutoff, and the time per inference. `CONFIG_HG_WAKE_WORD_HEY_HERMES` and `CONFIG_HG_WAKE_WORD_HEY_JARVIS` choose the models built in. On the AMOLED-1.75C only one model fits the 10% free-space check, so turn the other off; both models, or the test clips, push the image past it. To save space, TensorFlow Lite Micro is built with `-Oz` instead of its own `-O3`, and with `TF_LITE_STRIP_ERROR_STRINGS`, so it prints no error text. The models and their sources are listed in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
 ### Build checks
 
