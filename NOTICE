@@ -328,6 +328,24 @@ with one patch file per change in firmware/esp32/components/tailtiny-patches/.
 The licenses are in LICENSES/TailTiny-MIT.txt, LICENSES/wireguard-lwip-BSD-3-Clause.txt and
 LICENSES/STROBE-x25519-MIT.txt.
 
+The wake-word models in firmware/esp32/main/wake/ are included unmodified and
+built into the image only with CONFIG_HG_WAKE_WORD (off by default):
+hey_hermes.tflite is hey-hermes.tflite from
+https://github.com/miketomkins/hey-hermes-wakeword-model, revision
+b60fcf5066ad9c1fe4553168dcbb4c012d86c23b, Copyright (c) 2026 Mike Tomkins, MIT
+License (LICENSES/hey-hermes-wakeword-model-MIT.txt); hey_jarvis.tflite is
+models/v2/hey_jarvis.tflite from
+https://github.com/esphome/micro-wake-word-models, revision
+40ff33f57f8fc6ad71a75ef085abbf742495b225, Apache License 2.0
+(LICENSES/Apache-2.0.txt). The *_test.pcm clips beside them are synthetic
+speech made for this project with the Kokoro TTS model. With that option, the
+image also links esp-tflite-micro 1.4.2 (Espressif's TensorFlow Lite Micro,
+Apache License 2.0, with FlatBuffers, Apache License 2.0, and esp-nn, Apache
+License 2.0) and esp-micro-speech-features 1.2.3 (TensorFlow Lite Micro's
+audio frontend, Apache License 2.0, with KISS FFT, Copyright (c) 2003-2010
+Mark Borgerding, BSD 3-Clause License, LICENSES/kissfft-BSD-3-Clause.txt),
+both fetched at build time.
+
 
 The CrowPanel Advanced 10.1-inch ESP32-P4 build downloads Espressif components
 esp_hosted 2.12.6, esp_wifi_remote 1.6.5, and esp_lcd_ek79007 2.0.2 under the

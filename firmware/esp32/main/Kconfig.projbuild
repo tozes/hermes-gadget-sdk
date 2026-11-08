@@ -47,6 +47,38 @@ menu "Hermes Gadget"
             Adds about 108 KB of flash on the AMOLED-1.75C. Off on every
             board and in release images. docs/tailnet.md
 
+    config HG_WAKE_WORD
+        bool "Wake-word detector (experimental spike)"
+        default n
+        depends on SPIRAM && IDF_TARGET_ESP32S3
+        help
+            Builds in a microWakeWord detector: the TensorFlow Lite Micro
+            audio frontend (esp-micro-speech-features) and a streaming model
+            run by esp-tflite-micro, with its tensor arena in PSRAM. Spike
+            only: nothing feeds it the microphone yet. The console's
+            `wake-test [hermes|jarvis]` runs a model on a built-in clip
+            (HG_WAKE_WORD_TEST_CLIPS) or on one second of silence, and logs
+            the peak probability, the detection and the time per inference.
+            Off on every board and in release images.
+
+    config HG_WAKE_WORD_HEY_HERMES
+        bool "Embed the \"Hey Hermes\" model (62 KB)"
+        default y
+        depends on HG_WAKE_WORD
+
+    config HG_WAKE_WORD_HEY_JARVIS
+        bool "Embed the \"Hey Jarvis\" model (51 KB)"
+        default y
+        depends on HG_WAKE_WORD
+
+    config HG_WAKE_WORD_TEST_CLIPS
+        bool "Embed a 16 kHz test clip for each model (about 50 KB each)"
+        default n
+        depends on HG_WAKE_WORD
+        help
+            Synthetic speech (Kokoro TTS) for `wake-test`: "Hey Hermes" for
+            the Hey Hermes model, "Hey Jarvis" for the Hey Jarvis model.
+
     config HG_FRAME_STATS
         bool "Time every frame from boot"
         default n

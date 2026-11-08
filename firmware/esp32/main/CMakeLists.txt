@@ -25,6 +25,14 @@ endif()
 if(IDF_TARGET STREQUAL "esp32s3" OR IDF_TARGET STREQUAL "esp32p4")
     list(APPEND HG_RGB_REQUIRES esp_lcd_st7701 esp_lcd_panel_io_additions)
 endif()
+# Wake word: the components are fetched for every ESP32-S3 (idf_component.yml) and
+# required unconditionally there, because requirements are resolved before the
+# sdkconfig exists. port_wake.cpp compiles to nothing without CONFIG_HG_WAKE_WORD,
+# so nothing links them in.
+set(HG_WAKE_REQUIRES)
+if(IDF_TARGET STREQUAL "esp32s3")
+    list(APPEND HG_WAKE_REQUIRES esp-tflite-micro esp-micro-speech-features)
+endif()
 idf_component_register(
     SRCS
         "main.cpp"
@@ -65,6 +73,7 @@ idf_component_register(
         "port_wifi.cpp"
         "port_wifi_setup.cpp"
         "port_ws.cpp"
+        "port_wake.cpp"
     INCLUDE_DIRS "." "../../drivers" "${CMAKE_CURRENT_BINARY_DIR}"
     REQUIRES core
     # "driver" pulls in GPIO, I2S, LEDC and SPI on every ESP-IDF 5.x release.
@@ -94,4 +103,8 @@ idf_component_register(
         esp_websocket_client
         # Empty unless CONFIG_HG_TAILNET (components/tailtiny).
         tailtiny
+        ${HG_WAKE_REQUIRES}
 )
+# port_wake.cpp .incbin's the models from here (EMBED_FILES can't follow the
+# sdkconfig under PlatformIO, which needs every embedded file in platformio.ini).
+target_compile_definitions(${COMPONENT_LIB} PRIVATE "HG_WAKE_DIR=\"${CMAKE_CURRENT_LIST_DIR}/wake\"")

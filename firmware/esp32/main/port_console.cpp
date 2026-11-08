@@ -53,6 +53,9 @@ void begin() {
     cmd.func = &run;
     esp_console_cmd_register(&cmd);
   }
+#if CONFIG_HG_WAKE_WORD
+  wake::register_console();
+#endif
   esp_console_repl_t* repl = nullptr;
   esp_console_repl_config_t repl_cfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
   repl_cfg.prompt = "gadget>";

@@ -11,6 +11,16 @@ dependencies:
     version: "1.6.5"
     rules:
       - if: target in [esp32p4]
+  # Wake word (CONFIG_HG_WAKE_WORD, port_wake.cpp): TensorFlow Lite Micro and its
+  # audio frontend. Fetched for every ESP32-S3 build and linked only with the option on.
+  espressif/esp-tflite-micro:
+    version: "1.4.2"
+    rules:
+      - if: target in [esp32s3]
+  esphome/esp-micro-speech-features:
+    version: "1.2.3"
+    rules:
+      - if: target in [esp32s3]
   # ES8311 / ES7210 / AW88298 codecs on boards that use them
   espressif/esp_codec_dev: "~1.5"
   # Opus reply audio: Xiph libopus (BSD-3-Clause) packaged for ESP-IDF

@@ -148,6 +148,17 @@ The text the device shows by itself is listed once, with its English, in `firmwa
 
 A message a language leaves out shows in English, so a new message in `i18n.hpp` doesn't break the other languages; the completeness test says which are missing. Messages from Hermes are not in the catalogue.
 
+### Try the wake-word detector (experimental)
+
+`CONFIG_HG_WAKE_WORD` (off by default, ESP32-S3 with PSRAM only) builds in a microWakeWord detector: TensorFlow Lite Micro's audio frontend and a streaming model on `esp-tflite-micro`, with the tensor arena in PSRAM (`firmware/esp32/main/port_wake.cpp`). Nothing feeds it the microphone yet. To try it, add these lines to the board's `sdkconfig.defaults`, delete the generated `firmware/esp32/sdkconfig.<board>` and build:
+
+```
+CONFIG_HG_WAKE_WORD=y
+CONFIG_HG_WAKE_WORD_TEST_CLIPS=y
+```
+
+On the serial console, `wake-test hermes` or `wake-test jarvis` runs that model on its built-in synthetic clip (one second of silence without the clips) and prints the peak probability, whether the mean of the model's last five probabilities crossed its cutoff, and the time per inference. `CONFIG_HG_WAKE_WORD_HEY_HERMES` and `CONFIG_HG_WAKE_WORD_HEY_JARVIS` choose the models built in. The models and their sources are listed in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+
 ### Build checks
 
 Two checks stop a firmware build that would run with settings nobody asked for. Both run in every PlatformIO build, locally and in CI:

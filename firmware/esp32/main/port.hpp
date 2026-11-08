@@ -883,6 +883,13 @@ namespace console {
 void begin();
 }
 
+#if CONFIG_HG_WAKE_WORD
+namespace wake {
+// Registers the console's `wake-test [hermes|jarvis]` (port_wake.cpp).
+void register_console();
+}
+#endif
+
 // A phone companion app over Bluetooth LE, on boards with BoardConfig::bluetooth
 // (port_ble.cpp; docs/protocol.md#phone-app-over-bluetooth). The phone writes a
 // console line and reads the reply as notifications. Only a phone paired with
