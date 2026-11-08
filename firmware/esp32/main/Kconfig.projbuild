@@ -95,6 +95,19 @@ menu "Hermes Gadget"
         default 22860 if HG_WAKE_WORD_MODEL_HEY_JARVIS
         default 65536 if HG_WAKE_WORD_MODEL_HEY_HERMES
 
+    config HG_WAKE_WORD_ARENA_EXTRA
+        int "Tensor arena beyond the model's manifest (bytes)"
+        depends on HG_WAKE_WORD
+        range 0 262144
+        default 8192
+        help
+            Added to the manifest's tensor_arena_size for the arena in PSRAM.
+            The manifest's size covers TensorFlow Lite Micro's reference
+            kernels, but esp-nn's ESP32-S3 kernels plan scratch buffers on top
+            (5.5 KB more for Hey Hermes, 7.6 KB for Hey Jarvis), so Hey
+            Jarvis's 22,860 bytes alone fail AllocateTensors. The boot log and
+            `diag` `wake` show the arena used.
+
     config HG_WAKE_WORD_CUTOFF_PCT
         int "Detection cutoff (percent)"
         depends on HG_WAKE_WORD

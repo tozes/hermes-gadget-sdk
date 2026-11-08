@@ -7,7 +7,8 @@
 // a mean of the last N probabilities above the model's cutoff (hg::WakeWindow) posts one
 // EventType::Wake carrying that session, while it is still armed. The model, its phrase,
 // cutoff, window and arena come from the sdkconfig (CONFIG_HG_WAKE_WORD_MODEL and its values,
-// taken from the model's manifest).
+// taken from the model's manifest); the arena gets CONFIG_HG_WAKE_WORD_ARENA_EXTRA on top for
+// the scratch buffers esp-nn's kernels plan, which the manifest's size leaves out.
 #include "port.hpp"  // first: pulls in FreeRTOS.h ahead of task.h/queue.h
 
 #include "sdkconfig.h"
@@ -70,6 +71,8 @@ HG_INCBIN(hg_wake_clip, CONFIG_HG_WAKE_WORD_MODEL "_test.pcm")
 // The operators the built-in models use (checked with the LiteRT interpreter on the host;
 // SPLIT_V is Hey Hermes only).
 using Resolver = tflite::MicroMutableOpResolver<13>;
+// Resource variable slots (VAR_HANDLE); both built-in models use 6.
+constexpr int kVariables = 20;
 
 // TFLM's frontend and the streaming model, from 16 kHz samples to probabilities.
 class Model {
@@ -120,19 +123,27 @@ class Model {
     resolver_.AddSplitV();
     resolver_.AddStridedSlice();
 
-    constexpr size_t arena = CONFIG_HG_WAKE_WORD_ARENA;
-    arena_ = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    arena_ = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, kArena, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!arena_) {
-      ESP_LOGE(TAG, "no PSRAM for a %u B arena", unsigned(arena));
+      ESP_LOGE(TAG, "no PSRAM for a %u B arena", unsigned(kArena));
       return false;
     }
-    tflite::MicroAllocator* alloc = tflite::MicroAllocator::Create(arena_, arena);
-    tflite::MicroResourceVariables* vars = tflite::MicroResourceVariables::Create(alloc, 20);
+    // The resource variables' buffers (the model's streaming state) come from the arena
+    // whichever allocator holds their table (MicroResourceVariables::Allocate), so one arena.
+    tflite::MicroAllocator* alloc = tflite::MicroAllocator::Create(arena_, kArena);
+    tflite::MicroResourceVariables* vars = tflite::MicroResourceVariables::Create(alloc, kVariables);
     interp_ = new (std::nothrow) tflite::MicroInterpreter(tflite::GetModel(hg_wake_model_start), resolver_, alloc, vars);
-    if (!interp_ || interp_->AllocateTensors() != kTfLiteOk) {
-      ESP_LOGE(TAG, "AllocateTensors failed (arena %u B)", unsigned(arena));
+    if (!interp_) {
+      ESP_LOGE(TAG, "no memory for the interpreter");
       return false;
     }
+    if (interp_->AllocateTensors() != kTfLiteOk) {
+      ESP_LOGE(TAG, "AllocateTensors failed: arena %u B (manifest %u + extra %u), %u B taken when it stopped",
+               unsigned(kArena), unsigned(CONFIG_HG_WAKE_WORD_ARENA), unsigned(CONFIG_HG_WAKE_WORD_ARENA_EXTRA),
+               unsigned(interp_->arena_used_bytes()));
+      return false;
+    }
+    arena_used_ = interp_->arena_used_bytes();
     TfLiteTensor* in = interp_->input(0);
     TfLiteTensor* out = interp_->output(0);
     if (in->type != kTfLiteInt8 || in->dims->size != 3 || in->dims->data[2] != kFeatures ||
@@ -145,10 +156,15 @@ class Model {
     in_zero_ = in->params.zero_point;
     out_scale_ = out->params.scale;
     out_zero_ = out->params.zero_point;
-    ESP_LOGI(TAG, "%s: stride %d, arena %u of %u B (PSRAM)", CONFIG_HG_WAKE_WORD_MODEL, stride_,
-             unsigned(interp_->arena_used_bytes()), unsigned(arena));
+    ESP_LOGI(TAG, "%s: stride %d, arena %u of %u B (PSRAM, manifest %u + extra %u), %d resource variable slots in it",
+             CONFIG_HG_WAKE_WORD_MODEL, stride_, unsigned(arena_used_), unsigned(kArena),
+             unsigned(CONFIG_HG_WAKE_WORD_ARENA), unsigned(CONFIG_HG_WAKE_WORD_ARENA_EXTRA), kVariables);
     return true;
   }
+
+  // The tensor arena, for `diag`: its size and what AllocateTensors took of it.
+  static constexpr size_t kArena = CONFIG_HG_WAKE_WORD_ARENA + CONFIG_HG_WAKE_WORD_ARENA_EXTRA;
+  size_t arena_used() const { return arena_used_; }
 
   // Milliseconds of audio per probability.
   int ms_per_inference() const { return stride_ * kStepMs; }
@@ -196,6 +212,7 @@ class Model {
   FrontendState frontend_{};
   Resolver resolver_;
   uint8_t* arena_ = nullptr;  // holds the allocator and resource variables too
+  size_t arena_used_ = 0;
   tflite::MicroInterpreter* interp_ = nullptr;
   float in_scale_ = 1, out_scale_ = 1;
   int in_zero_ = 0, out_zero_ = 0;
@@ -248,6 +265,8 @@ class Detector final : public hg::WakeWord {
         .set("dropped_chunks", static_cast<unsigned>(feed_.dropped()))
         .set("invoke_us_mean", static_cast<unsigned>(model_.invoke_us_mean_.load()))
         .set("invoke_us_max", static_cast<unsigned>(model_.invoke_us_max_.load()))
+        .set("arena_bytes", static_cast<unsigned>(Model::kArena))
+        .set("arena_used_bytes", static_cast<unsigned>(model_.arena_used()))
         .set("model", CONFIG_HG_WAKE_WORD_MODEL);
   }
 

@@ -160,7 +160,8 @@ Then `set wake_word on` on the device. It listens only on USB power, connected t
 
 | Option | Default | What it sets |
 |---|---|---|
-| `CONFIG_HG_WAKE_WORD_MODEL_HEY_JARVIS` / `_HEY_HERMES` | Hey Jarvis | The one model built in, its phrase and its tensor arena (22,860 or 65,536 bytes) |
+| `CONFIG_HG_WAKE_WORD_MODEL_HEY_JARVIS` / `_HEY_HERMES` | Hey Jarvis | The one model built in, its phrase and its manifest's tensor arena (22,860 or 65,536 bytes) |
+| `CONFIG_HG_WAKE_WORD_ARENA_EXTRA` | 8192 | Bytes added to the manifest's arena. The manifest's size covers TensorFlow Lite Micro's reference kernels, but esp-nn's ESP32-S3 kernels plan scratch buffers on top (5.5 KB more for Hey Hermes, 7.6 KB for Hey Jarvis), which Hey Jarvis's 22,860 bytes alone can't hold. The boot log and `diag`'s `wake.arena_bytes` and `wake.arena_used_bytes` show the arena and what the model took. |
 | `CONFIG_HG_WAKE_WORD_CUTOFF_PCT` | 97 (Jarvis), 32 (Hermes) | A wake is the mean of the last probabilities above this percentage. Higher means fewer false wakes and more misses. |
 | `CONFIG_HG_WAKE_WORD_WINDOW` | 5 | How many probabilities, one per 30 ms of audio, the mean covers |
 | `CONFIG_HG_WAKE_WORD_TEST_CLIP` | off | Embeds a 16 kHz synthetic clip of the phrase for `wake-test` |
