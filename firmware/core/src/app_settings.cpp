@@ -30,6 +30,7 @@ bool App::menu_offered(Menu item) const {
     case Menu::ChargedSound: return hal_.power != nullptr && hal_.speaker != nullptr;
     case Menu::WifiDeepSleep: return hal_.power != nullptr && static_cast<bool>(current_wifi);
     case Menu::TouchTalk: return profile_.touch_screen && profile_.talk_key;
+    case Menu::WakeWord: return wake_supported();
     case Menu::TouchWake: return profile_.touch_screen && profile_.wake_key && hal_.display != nullptr;
     case Menu::DoubleHome: return profile_.talk_key;
     case Menu::WakeTalk: return profile_.talk_key && hal_.mic != nullptr && hal_.display != nullptr;
@@ -126,6 +127,9 @@ void App::settings_input(Button button, bool pressed) {
       break;
     case Menu::TouchTalk:
       console(touch_talk_ ? "set touch_talk off" : "set touch_talk on");
+      break;
+    case Menu::WakeWord:
+      console(wake_word_ ? "set wake_word off" : "set wake_word on");
       break;
     case Menu::Profile:
       if (!(profile_.touch_screen ? open_profile_picker() : next_agent_profile()))
@@ -349,6 +353,7 @@ SettingRow App::settings_row(Menu item, const std::string& label, const std::str
     case Menu::WifiDeepSleep: row.icon = Icon::Wifi; row.kind = Kind::Toggle; row.level = wifi_deep_sleep_; break;
     case Menu::IdleTimer: row.icon = Icon::Timer; break;
     case Menu::TouchTalk: row.icon = Icon::Touch; row.kind = Kind::Toggle; row.level = touch_talk_; break;
+    case Menu::WakeWord: row.icon = Icon::Mic; row.kind = Kind::Toggle; row.level = wake_word_; break;
     case Menu::TouchWake: row.icon = Icon::Touch; row.kind = Kind::Toggle; row.level = touch_wake_; break;
     case Menu::FaceDownSleep: row.icon = Icon::FaceDown; row.kind = Kind::Toggle; row.level = face_down_sleep_; break;
     case Menu::Clock: row.icon = Icon::Clock; break;
@@ -476,6 +481,10 @@ void App::settings_item(Menu item, UiModel& m) const {
     case Menu::TouchTalk:
       m.detail = tr(Msg::TouchTalk);
       m.body = touch_talk_ ? std::string(tr(Msg::TouchTalkOn)) : tr(Msg::TouchTalkOff, {talk});
+      break;
+    case Menu::WakeWord:
+      m.detail = tr(Msg::WakeWord, {profile_.wake_phrase});
+      m.body = tr(wake_word_ ? Msg::WakeWordOn : Msg::WakeWordOff, {profile_.wake_phrase});
       break;
     case Menu::Profile:
       m.detail = tr(Msg::ProfileSetting);

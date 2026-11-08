@@ -9019,3 +9019,416 @@ TEST("recording buffer: once its audio.end goes, the Thinking timeout is the sho
   CHECK(!r.app.in_turn());
   CHECK_EQ(r.app.model().detail, std::string("No reply from Hermes"));
 }
+
+// ---------------------------------------------------------------------------
+// The wake word (Hal::wake, DeviceProfile::wake_phrase)
+
+namespace {
+
+// The port's detector: what the core last told it, and every call.
+struct FakeWake : hg::WakeWord {
+  std::vector<bool> calls;
+  void set_armed(bool armed) override { calls.push_back(armed); }
+  bool armed() const { return !calls.empty() && calls.back(); }
+};
+
+// A supply the test plugs and unplugs; nullopt: the board can't tell.
+struct UsbPower : hg::Power {
+  std::optional<bool> usb = true;
+  std::optional<hg::PowerStatus> read() override {
+    hg::PowerStatus s;
+    s.external_power = usb;
+    return s;
+  }
+  bool power_off() override { return false; }
+  std::optional<bool> external_power() override { return usb; }
+};
+
+// A board with a wake word detector, on USB power.
+struct WakeRig : Rig {
+  FakeWake wake;
+  UsbPower power;
+  explicit WakeRig(hg::DeviceProfile p = wake_profile()) : Rig(std::move(p)) {
+    hal.wake = &wake;
+    hal.power = &power;
+  }
+  static hg::DeviceProfile wake_profile() {
+    hg::DeviceProfile p = profile("ws://hermes.local:8765/gadget");
+    p.wake_phrase = "Hey Hermes";
+    return p;
+  }
+  // Online and paired with `wake_word on` saved: armed once a tick has run.
+  void arm() {
+    fake.kv["wake_word"] = "on";
+    bring_online(true);
+    advance(200);
+  }
+  // `blocks` of 100 ms at `amp` (a square wave), the clock running alongside.
+  void feed(int16_t amp, int blocks) {
+    std::vector<int16_t> pcm(1600);
+    for (size_t i = 0; i < pcm.size(); ++i) pcm[i] = (i / 8) % 2 ? amp : static_cast<int16_t>(-amp);
+    for (int i = 0; i < blocks && fake.mic_on; ++i) {
+      app.on_mic_samples(pcm.data(), pcm.size());
+      advance(100);
+    }
+  }
+  bool indicator() const {
+    return app.screen() == hg::Screen::Ready && app.model().hint == "Listening for \"Hey Hermes\"";
+  }
+};
+
+}  // namespace
+
+TEST("wake: off by default; on, armed only on USB, online, paired and idle, telling the port only of changes") {
+  WakeRig r;
+  r.bring_online(true);
+  r.advance(500);
+  CHECK(r.wake.calls.empty());
+  CHECK(!r.app.wake_stats().armed);
+  CHECK_EQ(r.app.console("get wake_word"), std::string(R"(@value {"key":"wake_word","value":""})"));
+  CHECK(!r.indicator());
+
+  CHECK_EQ(r.app.console("set wake_word on"), std::string("@ok wake_word"));
+  r.advance(200);
+  CHECK(r.wake.armed());
+  CHECK(r.app.wake_stats().armed);
+  CHECK(r.indicator());
+  r.advance(5000);
+  CHECK_EQ(r.wake.calls.size(), size_t(1));  // no repeats while nothing changes
+
+  CHECK_EQ(r.app.console("set wake_word off"), std::string("@ok wake_word"));
+  r.advance(200);
+  CHECK(!r.wake.armed());
+  CHECK(!r.indicator());
+  CHECK_EQ(r.app.console("set wake_word maybe"), std::string("@error wake_word must be on or off"));
+  CHECK_EQ(r.app.console("set wake_word on"), std::string("@ok wake_word"));
+  r.advance(200);
+  CHECK(r.wake.armed());
+
+  // On battery, or a supply the board can't read: not armed. Unplugging disarms within 100 ms.
+  r.power.usb = false;
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  r.power.usb = true;
+  r.advance(200);
+  CHECK(r.wake.armed());
+  r.power.usb = std::nullopt;
+  r.advance(200);
+  CHECK(!r.wake.armed());
+  r.power.usb = true;
+  r.advance(200);
+  CHECK(r.wake.armed());
+  CHECK_EQ(r.wake.calls, (std::vector<bool>{true, false, true, false, true, false, true}));
+}
+
+TEST("wake: no power reading at all is never armed") {
+  WakeRig r;
+  r.hal.power = nullptr;
+  r.arm();
+  CHECK(r.wake.calls.empty());
+  r.app.on_wake();
+  CHECK(r.fake.last("audio.start") == nullptr);
+}
+
+TEST("wake: a lost connection or pairing disarms it until the device is back") {
+  WakeRig r;
+  r.arm();
+  CHECK(r.wake.armed());
+  r.app.on_transport_closed("lost");
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  reconnect(r);
+  r.advance(100);
+  CHECK(r.wake.armed());
+  r.server(R"({"type":"unpaired"})");
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  r.app.on_wake();
+  CHECK(r.fake.last("audio.start") == nullptr);
+  CHECK_EQ(r.app.wake_stats().detections, uint32_t(0));
+}
+
+TEST("wake: settings, a question, the alarm and a playing speaker each disarm it while they last") {
+  WakeRig r;
+  r.arm();
+  CHECK(r.wake.armed());
+
+  CHECK(r.app.open_settings());
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  r.app.close_settings();
+  r.advance(100);
+  CHECK(r.wake.armed());
+
+  r.server(R"({"type":"prompt","id":"q","title":"Allow?","text":"Continue?"})");
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  r.server(R"({"type":"prompt.close","id":"q"})");
+  r.advance(100);
+  CHECK(r.wake.armed());
+
+  r.server(R"({"type":"action","id":"t1","name":"timer.start","args":{"seconds":1}})");
+  r.advance(1100);
+  CHECK(r.app.screen() == hg::Screen::Alarm);
+  CHECK(!r.wake.armed());
+  r.app.on_wake();  // the alarm keeps the screen
+  CHECK(r.app.screen() == hg::Screen::Alarm);
+  r.app.on_button(hg::Button::Talk, true);  // dismisses it
+  r.app.on_button(hg::Button::Talk, false);
+  r.fake.spk_open = false;  // its beep cut short
+  r.advance(100);
+  CHECK(r.wake.armed());
+
+  r.fake.spk_draining = true;  // something still playing
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  r.fake.spk_draining = false;
+  r.advance(100);
+  CHECK(r.wake.armed());
+  CHECK_EQ(r.app.wake_stats().detections, uint32_t(0));
+}
+
+TEST("wake: a gadget lying face down is not armed") {
+  hg::DeviceProfile p = WakeRig::wake_profile();
+  p.motion_sensor = true;
+  WakeRig r(p);
+  r.fake.backlight = true;
+  r.fake.kv["face_down_sleep"] = "on";
+  r.arm();
+  r.hold_still(0, 0, 1000, 300);
+  CHECK(r.wake.armed());
+  r.hold_still(30, -20, -1000, 1000);
+  CHECK_EQ(r.fake.brightness, 0);
+  CHECK(!r.wake.armed());
+  r.app.on_wake();
+  CHECK(r.fake.last("audio.start") == nullptr);
+  r.hold_still(0, 0, 1000, 500);
+  CHECK(r.wake.armed());
+}
+
+TEST("wake: a wake while not armed is ignored") {
+  WakeRig r;
+  r.bring_online(true);  // wake_word off
+  r.advance(200);
+  const size_t samples = r.fake.spk_samples;
+  r.app.on_wake();
+  r.advance(500);
+  CHECK(r.fake.last("audio.start") == nullptr);
+  CHECK(!r.fake.mic_on);
+  CHECK_EQ(r.fake.spk_samples, samples);  // no beep
+  CHECK_EQ(r.app.wake_stats().detections, uint32_t(0));
+}
+
+TEST("wake: it beeps, records only once the beep has played, and the turn ends like tap-to-talk") {
+  WakeRig r;
+  r.fake.backlight = true;
+  r.fake.kv["screen_timeout"] = "30";
+  r.arm();
+  r.advance(31000);  // the screen went dark; still armed
+  CHECK_EQ(r.fake.brightness, 0);
+  CHECK(r.wake.armed());
+
+  r.app.on_wake();
+  CHECK_EQ(r.app.wake_stats().detections, uint32_t(1));
+  CHECK(r.fake.brightness > 0);  // the screen lights
+  CHECK(!r.wake.armed());  // it must not hear its own beep
+  CHECK_EQ(r.fake.spk_samples, size_t(16000 * (150 + 80 + 90) / 1000));  // the lead-in, 880 Hz 60 ms + 20 ms gap, 1320 Hz 90 ms
+  r.fake.spk_draining = true;  // the beep is playing
+  r.advance(300);
+  CHECK(r.fake.last("audio.start") == nullptr);
+  CHECK(!r.fake.mic_on);
+  r.app.on_wake();  // no second wake meanwhile
+  CHECK_EQ(r.app.wake_stats().detections, uint32_t(1));
+  r.fake.spk_draining = false;
+  r.advance(10);
+  const Value* start = r.fake.last("audio.start");
+  CHECK(start != nullptr);
+  if (!start) return;
+  CHECK_EQ((*start)["mode"].as_string(), std::string("wake"));
+  CHECK(r.fake.mic_on);
+  CHECK(r.app.screen() == hg::Screen::Listening);
+  CHECK_EQ(r.app.model().detail, std::string("Speak now - pause to send"));
+  CHECK(!r.wake.armed());
+
+  r.feed(1000, 10);
+  r.feed(20, 60);  // the pause ends it
+  CHECK(!r.fake.mic_on);
+  const Value* end = r.fake.last("audio.end");
+  CHECK(end && (*end)["stream"].as_int() == (*start)["stream"].as_int());
+  CHECK(r.app.screen() == hg::Screen::Thinking);
+  r.advance(100);
+  CHECK(!r.wake.armed());
+
+  r.server(R"({"type":"turn.start","turn":"a1"})");
+  r.server(R"({"type":"reply.delta","turn":"a1","text":"It is"})");
+  CHECK(r.app.screen() == hg::Screen::Responding);
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  r.server(R"({"type":"reply","turn":"a1","text":"It is sunny."})");
+  r.server(R"({"type":"turn.end","turn":"a1","outcome":"success"})");
+  r.advance(200);
+  CHECK(!r.app.in_turn());
+  CHECK(r.wake.armed());  // re-armed once the reply has finished
+  CHECK_EQ(r.app.wake_stats().no_speech, uint32_t(0));
+}
+
+TEST("wake: a speaker that never reports the beep finished delays the recording 1.5 s at most") {
+  WakeRig r;
+  r.arm();
+  r.app.on_wake();
+  r.fake.spk_draining = true;
+  r.advance(1400);
+  CHECK(r.fake.last("audio.start") == nullptr);
+  r.advance(200);
+  const Value* start = r.fake.last("audio.start");
+  CHECK(start && (*start)["mode"].as_string() == "wake");
+  CHECK(r.fake.mic_on);
+}
+
+TEST("wake: nobody speaking after a wake cancels quietly, counts a possible false wake and re-arms") {
+  WakeRig r;
+  r.arm();
+  r.app.on_wake();
+  r.advance(10);
+  CHECK(r.fake.mic_on);
+  r.feed(20, 80);  // silence until the no-speech limit
+  CHECK(!r.fake.mic_on);
+  const Value* cancel = r.fake.last("audio.cancel");
+  CHECK(cancel && (*cancel)["reason"].as_string() == "no speech");
+  CHECK(r.fake.last("audio.end") == nullptr);
+  CHECK(r.app.model().hint != "Didn't hear anything");
+  CHECK_EQ(r.app.wake_stats().no_speech, uint32_t(1));
+  CHECK_EQ(r.app.wake_stats().detections, uint32_t(1));
+  r.advance(100);
+  CHECK(r.wake.armed());
+  CHECK(r.indicator());
+
+  // A tap-to-talk recording that hears nothing still says so.
+  r.app.console("set talk_mode tap");
+  r.app.on_button(hg::Button::Talk, true);
+  r.app.on_button(hg::Button::Talk, false);
+  r.feed(20, 80);
+  CHECK_EQ(r.app.model().hint, std::string("Didn't hear anything"));
+  CHECK_EQ(r.app.wake_stats().no_speech, uint32_t(1));
+}
+
+TEST("wake: TALK still talks while armed, and a press during the beep takes over") {
+  WakeRig r;
+  r.arm();
+  CHECK(r.wake.armed());
+  r.app.on_button(hg::Button::Talk, true);
+  CHECK(!r.wake.armed());  // let go of the microphone before recording
+  CHECK(r.fake.mic_on);
+  const Value* start = r.fake.last("audio.start");
+  CHECK(start && (*start)["mode"].as_string() == "hold");
+  r.feed(1000, 5);
+  r.app.on_button(hg::Button::Talk, false);
+  CHECK(r.fake.last("audio.end") != nullptr);
+  r.server(R"({"type":"turn.start","turn":"a1"})");
+  r.server(R"({"type":"reply","turn":"a1","text":"Hi."})");
+  r.server(R"({"type":"turn.end","turn":"a1","outcome":"success"})");
+  r.advance(200);
+  CHECK(r.wake.armed());
+
+  r.app.on_wake();
+  r.fake.spk_draining = true;
+  r.app.on_button(hg::Button::Talk, true);  // during the beep
+  start = r.fake.last("audio.start");
+  CHECK(start && (*start)["mode"].as_string() == "hold");
+  r.fake.spk_draining = false;
+  r.advance(100);
+  start = r.fake.last("audio.start");
+  CHECK(start && (*start)["mode"].as_string() == "hold");  // the wake's recording never starts
+  CHECK(r.app.screen() == hg::Screen::Listening);
+}
+
+TEST("wake: a wake recording held through a lost connection is sent again as a wake") {
+  hg::DeviceProfile p = WakeRig::wake_profile();
+  p.recording_alloc = std::malloc;
+  WakeRig r(p);
+  r.arm();
+  r.app.on_wake();
+  r.advance(10);
+  r.feed(1000, 5);
+  r.app.on_transport_closed("disconnected");
+  r.feed(1000, 5);
+  r.feed(20, 60);
+  reconnect(r);
+  r.advance(20);
+  const Value* again = r.fake.last("audio.start");
+  CHECK(again && (*again)["resent"].as_int() == 1);
+  CHECK(again && (*again)["mode"].as_string() == "wake");
+}
+
+TEST("wake: the setting and its menu row, in English and Spanish") {
+  WakeRig r;
+  r.bring_online(true);
+  CHECK(r.app.open_settings());
+  for (int i = 0; i < 3; ++i) {  // Volume, Brightness, Talk mode, then the wake word
+    r.app.on_button(hg::Button::Down, true);
+    r.app.on_button(hg::Button::Down, false);
+  }
+  CHECK_EQ(r.app.model().detail, std::string("Wake word: Hey Hermes"));
+  CHECK_EQ(r.app.model().body, std::string("Off\nSelect to listen for \"Hey Hermes\" on USB power."));
+  const hg::SettingRow& row = r.app.model().settings[static_cast<size_t>(r.app.model().settings_sel)];
+  CHECK(row.kind == hg::SettingRow::Kind::Toggle);
+  CHECK_EQ(int(row.level), 0);
+  r.app.on_button(hg::Button::Talk, true);
+  r.app.on_button(hg::Button::Talk, false);
+  CHECK_EQ(r.fake.kv["wake_word"], std::string("on"));
+  CHECK_EQ(int(r.app.model().settings[static_cast<size_t>(r.app.model().settings_sel)].level), 1);
+  CHECK_EQ(r.app.console("set language es"), std::string("@ok language"));
+  CHECK_EQ(r.app.model().detail, std::string("Palabra clave: Hey Hermes"));
+  r.app.close_settings();
+  r.advance(200);
+  CHECK(r.wake.armed());
+  CHECK_EQ(r.app.model().hint, std::string("Escuchando «Hey Hermes»"));
+  r.app.console("set language en");
+  r.app.open_settings();
+  for (int i = 0; i < 3; ++i) {
+    r.app.on_button(hg::Button::Down, true);
+    r.app.on_button(hg::Button::Down, false);
+  }
+  r.app.on_button(hg::Button::Talk, true);
+  r.app.on_button(hg::Button::Talk, false);
+  CHECK_EQ(r.fake.kv["wake_word"], std::string("off"));
+
+  // Saved: a restart starts armed.
+  WakeRig again;
+  again.fake.kv = r.fake.kv;
+  again.fake.kv["wake_word"] = "on";
+  again.bring_online(true);
+  again.advance(200);
+  CHECK(again.wake.armed());
+}
+
+TEST("wake: hello announces the phrase; a board without a wake word has no setting, row or caps") {
+  WakeRig r;
+  r.bring_online(true);
+  const Value* hello = r.fake.last("hello");
+  CHECK(hello && (*hello)["caps"]["wake"]["phrase"].as_string() == "Hey Hermes");
+  CHECK(r.app.console("help").find(" wake_word") != std::string::npos);
+
+  auto check_absent = [](WakeRig& w) {
+    w.fake.kv["wake_word"] = "on";
+    w.bring_online(true);
+    w.advance(200);
+    const Value* h = w.fake.last("hello");
+    CHECK(h && (*h)["caps"]["wake"].is_null());
+    CHECK_EQ(w.app.console("get wake_word"), std::string("@error unknown key"));
+    CHECK_EQ(w.app.console("set wake_word on"), std::string("@error unknown key"));
+    CHECK(w.app.console("help").find(" wake_word") == std::string::npos);
+    CHECK(w.app.open_settings());
+    for (const auto& row : w.app.model().settings) CHECK(row.label.rfind("Wake word", 0) != 0);
+    w.app.close_settings();
+    w.advance(200);
+    CHECK(w.wake.calls.empty());
+    w.app.on_wake();
+    CHECK(w.fake.last("audio.start") == nullptr);
+  };
+  WakeRig no_phrase(Rig::profile("ws://hermes.local:8765/gadget"));  // a detector but no phrase
+  check_absent(no_phrase);
+  WakeRig no_detector;  // a phrase but no detector
+  no_detector.hal.wake = nullptr;
+  check_absent(no_detector);
+}

@@ -195,6 +195,15 @@ class Power {
   virtual std::optional<bool> external_power() { return std::nullopt; }
 };
 
+// An on-device wake word detector (DeviceProfile::wake_phrase names its phrase). The core
+// arms it only while a wake may start a turn (App::on_wake), and calls set_armed only when
+// that changes. While armed the port listens and calls App::on_wake when it hears the phrase.
+class WakeWord {
+ public:
+  virtual ~WakeWord() = default;
+  virtual void set_armed(bool armed) = 0;
+};
+
 // Everything except `system` and `transport` may be null when the board lacks it.
 struct Hal {
   System* system = nullptr;
@@ -206,6 +215,7 @@ struct Hal {
   AudioDecoder* speaker_decoder = nullptr;  // optional compressed speaker audio
   Updater* updater = nullptr;
   Power* power = nullptr;
+  WakeWord* wake = nullptr;  // null when the board has no wake word detector
 };
 
 }  // namespace hg

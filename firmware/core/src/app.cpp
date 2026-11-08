@@ -60,6 +60,10 @@ constexpr size_t kDashMaxEach = 12;     // sessions, and tiles, kept from one da
 // over 13 ms at a time): each frame is a WebSocket message, a TLS record and a queue slot, so
 // three times as many small ones cost the uplink, and fill the send queue three times sooner.
 constexpr uint32_t kMicFrameMs = 40;
+// The wake word's beep: a short rising 880/1320 Hz chirp. Recording starts once it has played, so
+// it isn't in the recording; a speaker that never reports idle holds the turn this long at most.
+constexpr Tone kWakeTones[] = {{880, 60, 20, 7000}, {1320, 90, 0, 7000}};
+constexpr uint32_t kWakeToneWaitMs = 1500;
 constexpr size_t kOtaAckBytes = 16 * 1024;  // a firmware update acknowledges every 16 KB written
 constexpr uint32_t kOtaIdleMs = 30000;      // ...and is abandoned when no data comes for this long
 constexpr uint32_t kOtaRestartMs = 1000;    // time for ota.done to leave before the restart
@@ -67,7 +71,8 @@ constexpr uint32_t kBackoffMs[] = {1000, 2000, 4000, 8000, 15000, 30000};
 constexpr size_t kBackoffSteps = sizeof(kBackoffMs) / sizeof(kBackoffMs[0]);
 
 const char* const kSettingKeys[] = {"name", "server", "token", "talk_mode", "volume", "brightness", "screen_timeout", "battery_display", "battery_estimate", "language", "wifi_ssid", "wifi_pass",
-                                    "face_down_sleep", "clock", "time_format", "touch_wake", "battery_alert", "battery_alert_sound", "charging_notice", "charging_sound", "charged_notice", "charged_sound", "double_home", "wake_talk", "touch_talk", "profile_grid", "wifi_deep_sleep"};
+                                    "face_down_sleep", "clock", "time_format", "touch_wake", "battery_alert", "battery_alert_sound", "charging_notice", "charging_sound", "charged_notice", "charged_sound", "double_home", "wake_talk", "touch_talk", "profile_grid", "wifi_deep_sleep",
+                                    "wake_word"};  // wake_word: only where App::wake_supported (known_setting)
 
 // NVS limits storage keys to 15 characters; keep the public setting name unchanged.
 std::string_view setting_storage_key(std::string_view key) {
@@ -243,6 +248,7 @@ void App::load_settings() {
   wake_talk_ = setting("wake_talk", "off") == "on";
   touch_talk_ = !profile_.talk_key || setting("touch_talk", "on") != "off";
   wifi_deep_sleep_ = setting("wifi_deep_sleep", "on") != "off";
+  wake_word_ = wake_supported() && setting("wake_word", "off") == "on";
   {
     const int grid = std::atoi(setting("profile_grid", "9").c_str());
     profile_grid_ = static_cast<uint8_t>(grid == 4 || grid == 6 || grid == 16 ? grid : 9);
@@ -642,6 +648,7 @@ void App::send_hello() {
   if (profile_.has_scroll_buttons) inputs.push("up").push("down");
   caps.set("inputs", inputs);
   caps.set("talk_mode", talk_mode_ == TalkMode::Tap ? "tap" : "hold");
+  if (wake_supported()) caps.set("wake", json::Value::object().set("phrase", profile_.wake_phrase));
   if (ui_ && can_open_dashboard()) {
     json::Value dash = json::Value::object();
     dash.set("v", kDashboardVersion).set("rows", ui_->dash_rows());
@@ -1627,10 +1634,12 @@ void App::on_button(Button button, bool pressed, bool touch) {
   update_model();
 }
 
-void App::start_listening(bool hands_free) {
+void App::start_listening(bool hands_free, bool wake) {
   stop_playback();
   dismiss_overlay();
   if (alarm_) dismiss_alarm();
+  wake_pending_ = false;  // a press during a wake's beep takes over
+  set_wake_armed(false);  // the detector lets go of the microphone first
   if (!hal_.mic || !hal_.mic->start(profile_.mic_rate)) {
     set_hint_flash(tr(i18n::Msg::MicUnavailable));
     return;
@@ -1638,6 +1647,7 @@ void App::start_listening(bool hands_free) {
   // Talking over a recording still uploading replaces it: the hub drops its part first.
   if (rec_on_) cancel_upload("replaced");
   hands_free_ = hands_free;
+  wake_turn_ = wake;
   mic_stream_ = static_cast<uint8_t>(mic_stream_ % 250 + 1);
   mic_seq_ = 0;
   mic_unsent_ = 0;
@@ -1732,6 +1742,52 @@ void App::cancel_listening(std::string_view why) {
   mode_since_ = now();
 }
 
+// --------------------------------------------------------------------------
+// The wake word (Hal::wake): armed only on USB power, with Hermes reachable, and nothing else
+// on the device the user is busy with.
+
+bool App::wake_ready(bool speaker) const {
+  return wake_word_ && wake_usb_ && can_talk() && mode_ == Mode::Idle && !settings_open() && !menu_open() &&
+         prompt_id_.empty() && !alarm_ && !face_down_ && wifi_setup_text_.empty() && !phone_pairing_ &&
+         !ota_busy() && ota_ != Ota::Restarting && (!speaker || !speaking());
+}
+
+void App::set_wake_armed(bool armed) {
+  if (armed == wake_armed_ || !hal_.wake) return;
+  wake_armed_ = armed;
+  hal_.wake->set_armed(armed);
+  log(LogLevel::Debug, armed ? "wake word armed" : "wake word disarmed");
+}
+
+void App::wake_tick() {
+  if (wake_pending_) {
+    if (!wake_ready(false)) {
+      wake_pending_ = false;  // something took over during the beep
+    } else if (!speaking() || static_cast<int32_t>(now() - wake_pending_until_) >= 0) {
+      start_listening(true, true);  // stops a beep still playing at the deadline
+      update_model();
+    }
+  }
+  const bool was = wake_armed_;
+  set_wake_armed(!wake_pending_ && wake_ready(true));
+  if (wake_armed_ != was) update_model();  // the indicator
+}
+
+void App::on_wake() {
+  if (!wake_armed_ || wake_pending_ || !wake_ready(true)) {
+    log(LogLevel::Debug, "wake word ignored: not armed");
+    return;
+  }
+  ++wake_detections_;
+  log(LogLevel::Info, "wake word heard");
+  wake_display();
+  set_wake_armed(false);  // the detector must not hear its own beep
+  play_tones(kWakeTones, sizeof(kWakeTones) / sizeof(kWakeTones[0]));
+  wake_pending_ = true;
+  wake_pending_until_ = now() + kWakeToneWaitMs;
+  update_model();
+}
+
 void App::go_home() {
   wake_display();
   if (mode_ == Mode::Listening) cancel_listening("cancelled");
@@ -1766,7 +1822,7 @@ bool App::send_audio_start() {
       .set("stream", mic_stream_)
       .set("rate", profile_.mic_rate)
       .set("format", "pcm16")
-      .set("mode", hands_free_ ? "tap" : "hold");
+      .set("mode", wake_turn_ ? "wake" : hands_free_ ? "tap" : "hold");
   // Sent again after a lost connection: how long ago it began. Hermes may ignore it.
   if (rec_resends_) start.set("resent", rec_resends_).set("age_ms", now() - rec_started_at_);
   return send(start);
@@ -1904,7 +1960,9 @@ void App::on_mic_samples(const int16_t* samples, size_t count) {
       update_model();
     } else if (r == Vad::Result::NoSpeech) {
       cancel_listening("no speech");
-      set_hint_flash(tr(i18n::Msg::DidntHearAnything));
+      // Nobody spoke after a wake: likely a false one, so back to listening for it without a word.
+      if (wake_turn_) ++wake_no_speech_;
+      else set_hint_flash(tr(i18n::Msg::DidntHearAnything));
       update_model();
     }
   }
@@ -2382,6 +2440,7 @@ void App::tick() {
     if (turn_page()) update_model();
   }
 
+  wake_tick();
   flush_sensors();
   flush_display_state();
   timer_tick();
@@ -2714,6 +2773,8 @@ void App::update_model() {
     const bool tap = talk_mode_ == TalkMode::Tap;
     m.hint = profile_.touch_screen && touch_talk_ ? std::string(tr(tap ? Msg::TapScreenToTalk : Msg::HoldScreenToTalk))
                                    : tr(tap ? Msg::TapButtonToTalk : Msg::HoldButtonToTalk, {talk});
+    // Armed, the hint says the device listens for its wake word (TALK still works as before).
+    if (wake_armed_) m.hint = tr(Msg::WakeListening, {profile_.wake_phrase});
     bool showing_reply = !reply_.empty() && static_cast<int32_t>(reply_until_ - now()) > 0;
     m.hero = !showing_reply;
     if (m.hero) {
@@ -2851,6 +2912,7 @@ std::string App::diag_report() {
 }
 
 bool App::known_setting(std::string_view key) const {
+  if (key == "wake_word") return wake_supported();
   for (const char* k : kSettingKeys) {
     if (key == k) return true;
   }
@@ -2874,7 +2936,8 @@ std::string App::console(std::string_view raw) {
 
   if (cmd == "help") {
     std::string keys;
-    for (const char* k : kSettingKeys) keys += std::string(" ") + k;
+    for (const char* k : kSettingKeys)
+      if (known_setting(k)) keys += std::string(" ") + k;
     for (const auto& k : profile_.extra_settings) keys += " " + k;
     if (profile_.tailnet)
       for (const char* k : kTailnetKeys) keys += std::string(" ") + k;
@@ -2954,6 +3017,8 @@ std::string App::console(std::string_view raw) {
       return "@error wake_talk must be on or off";
     if (key == "touch_talk" && !value.empty() && value != "on" && value != "off")
       return "@error touch_talk must be on or off";
+    if (key == "wake_word" && !value.empty() && value != "on" && value != "off")
+      return "@error wake_word must be on or off";
     if (key == "wifi_deep_sleep" && !value.empty() && value != "on" && value != "off")
       return "@error wifi_deep_sleep must be on or off";
     if (key == "profile_grid" && !value.empty() && value != "4" && value != "6" && value != "9" && value != "16")

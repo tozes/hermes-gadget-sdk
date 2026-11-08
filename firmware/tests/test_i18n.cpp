@@ -247,6 +247,7 @@ std::string filled(Lang lang, Msg m) {
     case Msg::PhoneCode: a = "123456"; break;
     case Msg::ProfileGreeting: a = "Equipo de trabajo"; break;  // a long profile name
     case Msg::TimerLeft: a = "24:00:00"; break;  // the longest timer: 86400 s
+    case Msg::WakeListening: a = "Hey Hermes"; break;
     default: break;
   }
   return hg::i18n::format(hg::i18n::text(lang, m), {a, b});
@@ -264,7 +265,7 @@ constexpr Msg kLines[] = {
     Msg::Cancelled, Msg::NewSessionIn, Msg::NewSession, Msg::MicUnavailable, Msg::AnsweredYes, Msg::AnsweredNo,
     Msg::PhonePaired, Msg::PhonePairingFailed, Msg::PhonePairingClosed, Msg::BluetoothUnavailable,
     Msg::WifiSetupUnavailable, Msg::ProfileListHint, Msg::ProfileCantSwitch, Msg::ProfileRefusedBusy,
-    Msg::ProfileRefusedUnknown, Msg::ProfileRefused,
+    Msg::ProfileRefusedUnknown, Msg::ProfileRefused, Msg::WakeListening,
     // hero headlines and one-line captions
     Msg::HiImHermes, Msg::AskMeAnything, Msg::UpShowsLastReply, Msg::SwipeDownForSessions,
     Msg::ButtonShowsSessions, Msg::LowBattery, Msg::Listening, Msg::SpeakNowPause, Msg::LiftFingerToSend, Msg::OfflineStillRecording, Msg::ReconnectingToSend,
