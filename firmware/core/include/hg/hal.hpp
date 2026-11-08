@@ -197,7 +197,9 @@ class Power {
 
 // An on-device wake word detector (DeviceProfile::wake_phrase names its phrase). The core
 // arms it only while a wake may start a turn (App::on_wake), and calls set_armed only when
-// that changes. While armed the port listens and calls App::on_wake when it hears the phrase.
+// that changes. While armed the port listens and calls App::on_wake with session() when it
+// hears the phrase, from audio heard in that session only. Every set_armed call starts a new
+// session, so the core can tell a late detection from an earlier arming and ignore it.
 // The core disarms it before it starts a recording (AudioIn::start right after
 // set_armed(false)), so set_armed(false) must not return while the detector still holds
 // the microphone in a way that would keep the recording from getting every chunk.
@@ -205,6 +207,8 @@ class WakeWord {
  public:
   virtual ~WakeWord() = default;
   virtual void set_armed(bool armed) = 0;
+  // The session the last set_armed call started; read on the thread that calls set_armed.
+  virtual uint32_t session() const = 0;
 };
 
 // Everything except `system` and `transport` may be null when the board lacks it.

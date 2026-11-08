@@ -1784,9 +1784,13 @@ void App::drop_pending_wake(std::string_view why, bool stop_beep) {
   log(LogLevel::Info, "wake word dropped: " + std::string(why));
 }
 
-void App::on_wake() {
+void App::on_wake(uint32_t session) {
   if (!wake_armed_ || wake_pending_ || !wake_ready(true)) {
     log(LogLevel::Debug, "wake word ignored: not armed");
+    return;
+  }
+  if (session != hal_.wake->session()) {
+    log(LogLevel::Debug, "wake word ignored: heard before the detector was last armed");
     return;
   }
   wake_display();

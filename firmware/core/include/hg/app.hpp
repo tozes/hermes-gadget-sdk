@@ -157,11 +157,13 @@ class App {
   // times a second from the thread that calls tick().
   void on_motion(int16_t x_mg, int16_t y_mg, int16_t z_mg);
   void on_mic_samples(const int16_t* samples, size_t count);
-  // The wake word detector (Hal::wake) heard its phrase. Ignored unless the detector should be
-  // armed now; otherwise lights the screen, beeps, and once the beep has played starts a
-  // hands-free turn like tap-to-talk (audio.start mode "wake"). No beep, no turn; CANCEL during
-  // the beep, or anything that disarms the detector meanwhile, drops the wake.
-  void on_wake();
+  // The wake word detector (Hal::wake) heard its phrase in the armed session `session`
+  // (WakeWord::session). Ignored unless that session is still the armed one and the
+  // detector should be armed now: a detection from before a disarm doesn't start a later turn.
+  // Otherwise lights the screen, beeps, and once the beep has played starts a hands-free turn
+  // like tap-to-talk (audio.start mode "wake"). No beep, no turn; CANCEL during the beep, or
+  // anything that disarms the detector meanwhile, drops the wake.
+  void on_wake(uint32_t session);
   WakeStats wake_stats() const { return {wake_armed_, wake_detections_, wake_no_speech_}; }
 
   // --- device features ------------------------------------------------------

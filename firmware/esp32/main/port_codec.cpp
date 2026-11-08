@@ -19,7 +19,7 @@ namespace hgp {
 namespace {
 
 const char* TAG = "hg.codec";
-constexpr size_t kMicChunk = 320;             // about 13 ms at 24 kHz
+constexpr size_t kMicChunk = CodecMic::kChunk;
 constexpr size_t kSpeakerBuffer = 192 * 1024;  // absorbs WiFi-burst backlog without dropping; PSRAM, 8 MB free
 constexpr size_t kSpeakerChunk = 512;         // samples per codec write
 
@@ -244,7 +244,7 @@ void CodecMic::task(void* arg) {
     void deliver(const int16_t* chunk) { events::post(EventType::Mic, chunk, kMicChunk * sizeof(int16_t)); }
     void listen(const int16_t* chunk) {
 #if CONFIG_HG_WAKE_WORD
-      if (mic->sink_) mic->sink_(chunk, kMicChunk);
+      if (mic->sink_) mic->sink_(chunk);
 #endif
     }
     void wait() { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)); }

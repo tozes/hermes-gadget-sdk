@@ -118,7 +118,7 @@ using ConsoleRequest = hg::SharedReply<ConsoleSignal>;
 
 struct Event {
   EventType type;
-  uint32_t generation;  // WebSocket connection generation (stale events are dropped)
+  uint32_t generation;  // WebSocket connection generation (stale events are dropped); Wake: its armed session
   uint8_t* data;        // heap payload owned by the event, freed after dispatch
   size_t len;
   ConsoleRequest* console;
@@ -509,14 +509,15 @@ class CodecAudio {
 
 class CodecMic final : public hg::AudioIn {
  public:
+  static constexpr size_t kChunk = 320;  // samples per read, about 13 ms at 24 kHz
   bool begin(esp_codec_dev_handle_t dev, bool rmnm, const CodecAudio::MicLink& link);
   bool start(uint32_t sample_rate) override;
   void stop() override { capturing_ = false; }
 #if CONFIG_HG_WAKE_WORD
   // The wake word detector's always-on capture (port_wake.cpp): while listening and not
-  // recording, the ADC stays on and every chunk (24 kHz) goes to `sink` on the mic task
-  // instead of to the app. A recording takes over until it stops (hg::MicPower).
-  using Sink = void (*)(const int16_t* pcm, size_t samples);
+  // recording, the ADC stays on and every chunk (kChunk samples, 24 kHz) goes to `sink` on
+  // the mic task instead of to the app. A recording takes over until it stops (hg::MicPower).
+  using Sink = void (*)(const int16_t* pcm);
   void set_sink(Sink sink) { sink_ = sink; }
   void set_listening(bool on);
 #endif

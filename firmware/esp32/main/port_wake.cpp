@@ -1,11 +1,13 @@
 // The wake word detector (CONFIG_HG_WAKE_WORD). While the core arms it (hg::WakeWord), the
-// codec microphone's mic task hands it every 24 kHz chunk through a stream buffer instead of
-// posting them to the app (CodecMic::set_listening). Its own task resamples them to 16 kHz
+// codec microphone's mic task hands it every 24 kHz chunk through a ring of whole chunks
+// (hg::WakeFeed) instead of posting them to the app (CodecMic::set_listening), each tagged with
+// the armed session it was heard in. Its own task resamples them to 16 kHz
 // (hg::Resample3to2), runs TensorFlow Lite Micro's audio frontend (40 features per 30 ms
 // window, 10 ms step) and the streaming microWakeWord model (one inference per 3 steps), and
 // a mean of the last N probabilities above the model's cutoff (hg::WakeWindow) posts one
-// EventType::Wake. The model, its phrase, cutoff, window and arena come from the sdkconfig
-// (CONFIG_HG_WAKE_WORD_MODEL and its values, taken from the model's manifest).
+// EventType::Wake carrying that session, while it is still armed. The model, its phrase,
+// cutoff, window and arena come from the sdkconfig (CONFIG_HG_WAKE_WORD_MODEL and its values,
+// taken from the model's manifest).
 #include "port.hpp"  // first: pulls in FreeRTOS.h ahead of task.h/queue.h
 
 #include "sdkconfig.h"
@@ -29,6 +31,7 @@
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_resource_variable.h"
 #include "tensorflow/lite/micro/schema/schema_generated.h"
+#include "wake_feed.hpp"
 #include "wake_window.hpp"
 
 namespace hgp::wake {
@@ -43,9 +46,9 @@ constexpr int kStepMs = 10;  // one feature row
 // training features are the same outputs as floats (pymicro-features does the same).
 constexpr float kFeatureScale = 0.0390625f;
 constexpr int kRefractoryMs = 2000;  // after a detection, before the next can count
-// Audio from the mic task, 24 kHz: 0.5 s, in PSRAM. Read in 20 ms pieces.
-constexpr size_t kAudioBuffer = 24000;
-constexpr size_t kReadSamples = 480;
+// Audio from the mic task, 24 kHz, in whole chunks (hg::WakeFeed): 37 of them, 0.49 s, in PSRAM.
+using Feed = hg::WakeFeed<CodecMic::kChunk>;
+constexpr size_t kFeedSlots = 38;  // one stays empty
 // Inference runs on this stack, in internal RAM (TFLM's kernels keep their scratch there).
 // ponytail: not measured on the board; `diag` `stacks` shows hg-wake's free bytes to trim it.
 constexpr uint32_t kTaskStack = 8192;
@@ -205,7 +208,7 @@ class Model {
 class Detector final : public hg::WakeWord {
  public:
   // Only for a detector whose begin() failed: one that began has a task using it for good.
-  ~Detector() override { heap_caps_free(storage_); }
+  ~Detector() override { heap_caps_free(ring_); }
 
   // Everything that can fail comes before the task starts; after that the detector is
   // published (instance, the mic's sink) and never freed. On false the caller deletes it.
@@ -213,10 +216,7 @@ class Detector final : public hg::WakeWord {
     if (!model_.begin()) return false;
     window_ = hg::WakeWindow(CONFIG_HG_WAKE_WORD_CUTOFF_PCT / 100.0f, CONFIG_HG_WAKE_WORD_WINDOW,
                              kRefractoryMs / model_.ms_per_inference());
-    storage_ = static_cast<uint8_t*>(heap_caps_malloc(kAudioBuffer + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    static StaticStreamBuffer_t control;
-    audio_ = storage_ ? xStreamBufferCreateStatic(kAudioBuffer, 1, storage_, &control) : nullptr;
-    if (!audio_ || xTaskCreate(&Detector::task, "hg-wake", kTaskStack, this, 3, nullptr) != pdPASS) {
+    if (!ring_ || xTaskCreate(&Detector::task, "hg-wake", kTaskStack, this, 3, &task_) != pdPASS) {
       ESP_LOGE(TAG, "no memory for the detector's audio buffer or task");
       return false;
     }
@@ -231,18 +231,21 @@ class Detector final : public hg::WakeWord {
   // The detector never reads the ES7210 itself: the mic task is its only reader and hands
   // the detector chunks only while listening and not capturing (hg::MicPower::turn). So
   // disarming just clears listening, and the AudioIn::start() the core calls next takes
-  // every chunk from then on even if the mic task hasn't seen this yet. Audio already queued
-  // here is dropped on re-arm; a detection from it posts nothing once disarmed, and the
-  // core ignores one posted just before (App::on_wake checks that it is armed).
+  // every chunk from then on even if the mic task hasn't seen this yet. The session goes to
+  // the feed before listening changes, so chunks the mic task hands over from then on carry
+  // it: audio still queued from an earlier session is skipped, a detection from it posts
+  // nothing (hg::WakeFeed::current), and the core ignores one posted before (App::on_wake).
   void set_armed(bool armed) override {
-    if (armed) restart_ = true;  // before the first chunk arrives
-    armed_ = armed;
+    ++session_;
+    feed_.set_session(armed ? session_ : 0);
     mic_->set_listening(armed);
-    ESP_LOGI(TAG, "%s", armed ? "armed" : "disarmed");
+    ESP_LOGI(TAG, "%s (session %u)", armed ? "armed" : "disarmed", unsigned(session_));
   }
+  uint32_t session() const override { return session_; }
 
   void report(hg::json::Value& wake) const {
     wake.set("last_peak", static_cast<double>(last_peak_.load()))
+        .set("dropped_chunks", static_cast<unsigned>(feed_.dropped()))
         .set("invoke_us_mean", static_cast<unsigned>(model_.invoke_us_mean_.load()))
         .set("invoke_us_max", static_cast<unsigned>(model_.invoke_us_max_.load()))
         .set("model", CONFIG_HG_WAKE_WORD_MODEL);
@@ -258,47 +261,51 @@ class Detector final : public hg::WakeWord {
   static Detector* instance;
 
  private:
-  // On the mic task: whatever doesn't fit is dropped (the detector fell 0.5 s behind).
-  static void sink(const int16_t* pcm, size_t samples) {
-    xStreamBufferSend(instance->audio_, pcm, samples * sizeof(int16_t), 0);
+  // On the mic task: a chunk that doesn't fit is dropped whole (the detector fell 0.49 s
+  // behind), and the detector starts its audio over at the next one.
+  static void sink(const int16_t* pcm) {
+    if (instance->feed_.push(pcm)) xTaskNotifyGive(instance->task_);
   }
 
   static void task(void* arg) {
     auto* self = static_cast<Detector*>(arg);
-    int16_t in[kReadSamples];
-    int16_t pcm[hg::Resample3to2::max_out(kReadSamples)];
     for (;;) {
       // A second without audio (disarmed) still comes round for `wake-test`.
-      const size_t got = xStreamBufferReceive(self->audio_, in, sizeof(in), pdMS_TO_TICKS(1000));
+      if (!self->feed_.take([self](const int16_t* pcm, size_t n, uint32_t session, bool restart) {
+            self->hear(pcm, n, session, restart);
+          }))
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
       if (self->test_.load()) {
         self->run_test();
-        self->test_ = false;  // printed: the next wake-test may queue
+        self->feed_.restart();  // live detection starts over from the next chunk
+        self->test_ = false;    // printed: the next wake-test may queue
       }
-      if (self->restart_.exchange(false)) {
-        // (Re)armed, or after a test: start from silence, not from audio left over.
-        xStreamBufferReset(self->audio_);
-        self->resampler_.reset();
-        self->model_.reset();
-        self->window_.reset();
-        continue;
-      }
-      if (got < sizeof(int16_t)) continue;
-      const size_t n = self->resampler_.process(in, got / sizeof(int16_t), pcm);
-      bool detected = false;
-      const bool ok = self->model_.feed(pcm, n, [self, &detected](float p) {
-        if (self->window_.push(p)) detected = true;
-      });
-      if (!ok && !self->failed_) ESP_LOGE(TAG, "inference failed");
-      self->failed_ = !ok;
-      if (!detected) continue;
-      // The window has started over; the model starts from silence too.
-      self->model_.reset();
-      const float mean = self->window_.mean();
-      self->last_peak_ = mean;
-      if (!self->armed_) continue;  // disarmed while this audio waited
-      ESP_LOGI(TAG, "detected p=%.2f", static_cast<double>(mean));
-      events::post(EventType::Wake);
     }
+  }
+
+  // One chunk heard in armed session `session`; `restart`: it doesn't follow the last one.
+  void hear(const int16_t* in, size_t samples, uint32_t session, bool restart) {
+    if (restart) {
+      resampler_.reset();
+      model_.reset();
+      window_.reset();
+    }
+    int16_t pcm[hg::Resample3to2::max_out(CodecMic::kChunk)];
+    const size_t n = resampler_.process(in, samples, pcm);
+    bool detected = false;
+    const bool ok = model_.feed(pcm, n, [this, &detected](float p) {
+      if (window_.push(p)) detected = true;
+    });
+    if (!ok && !failed_) ESP_LOGE(TAG, "inference failed");
+    failed_ = !ok;
+    if (!detected) return;
+    // The window has started over; the model starts from silence too.
+    model_.reset();
+    const float mean = window_.mean();
+    last_peak_ = mean;
+    if (!feed_.current(session)) return;  // disarmed or re-armed while this audio waited
+    ESP_LOGI(TAG, "detected p=%.2f", static_cast<double>(mean));
+    events::post(EventType::Wake, nullptr, 0, session);
   }
 
   // Feeds the built-in 16 kHz clip (or a second of silence) through the model and the
@@ -334,16 +341,19 @@ class Detector final : public hg::WakeWord {
                 detected_at ? "DETECTED" : "not detected", unsigned(detected_at * model_.ms_per_inference()),
                 unsigned(inferences), unsigned(model_.invoke_us_mean_.load()), unsigned(model_.invoke_us_max_.load()),
                 ok ? "" : "; inference FAILED");
-    restart_ = true;
   }
 
   Model model_;
   hg::Resample3to2 resampler_;
   hg::WakeWindow window_{1, 1, 0};
-  uint8_t* storage_ = nullptr;  // audio_'s, in PSRAM
-  StreamBufferHandle_t audio_ = nullptr;
+  // feed_'s chunks, in PSRAM (null if that failed; begin() checks).
+  Feed::Slot* ring_ = static_cast<Feed::Slot*>(
+      heap_caps_malloc(sizeof(Feed::Slot) * kFeedSlots, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  Feed feed_{ring_, kFeedSlots};
+  TaskHandle_t task_ = nullptr;
   CodecMic* mic_ = nullptr;
-  std::atomic<bool> armed_{false}, restart_{false}, test_{false};
+  uint32_t session_ = 0;  // the app task's: one more on every arm and disarm
+  std::atomic<bool> test_{false};
   std::atomic<float> last_peak_{0};
   bool failed_ = false;
 };

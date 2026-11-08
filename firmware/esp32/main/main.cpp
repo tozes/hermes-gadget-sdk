@@ -294,7 +294,7 @@ void dispatch(hg::App& app, hgp::Event& ev) {
       g_time.on_synced();  // writes the RTC from the now-set clock
       break;
 #if CONFIG_HG_WAKE_WORD
-    case EventType::Wake: app.on_wake(); break;
+    case EventType::Wake: app.on_wake(ev.generation); break;  // the armed session it was heard in
 #endif
   }
 }
