@@ -293,6 +293,9 @@ void dispatch(hg::App& app, hgp::Event& ev) {
     case EventType::TimeSynced:
       g_time.on_synced();  // writes the RTC from the now-set clock
       break;
+#if CONFIG_HG_WAKE_WORD
+    case EventType::Wake: app.on_wake(); break;
+#endif
   }
 }
 
@@ -437,6 +440,9 @@ extern "C" void app_main(void) {
     // Light-sleep boards power the DAC down while dozing, if the mics don't share it.
     if (board.light_sleep && g_codec.mic_link().switchable) g_codec_speaker.allow_power_down(g_codec.mic_link().format);
   }
+#if CONFIG_HG_WAKE_WORD
+  if (board.wake_word && hal.mic == &g_codec_mic) hal.wake = hgp::wake::begin(g_codec_mic);
+#endif
   if (hal.speaker) hal.speaker_decoder = &g_opus;  // Opus replies when Hermes offers them
   const bool imu = peripherals_ready && board.imu.enabled && g_motion.begin(board.imu, i2c_bus);
   g_time.begin(board.rtc, i2c_bus, g_storage);
@@ -545,6 +551,9 @@ extern "C" void app_main(void) {
   if (hal.speaker == &g_codec_speaker) profile.speaker_rate = hgp::CodecAudio::kRate;
   profile.tailnet = hgp::TailnetLink::supported();
 #endif
+#if CONFIG_HG_WAKE_WORD
+  if (hal.wake) profile.wake_phrase = CONFIG_HG_WAKE_WORD_PHRASE;
+#endif
 
 #if CONFIG_HG_BOARD_ESP32_CYD
   // From the heap, so the early framebuffer can take the one large contiguous
@@ -593,6 +602,9 @@ extern "C" void app_main(void) {
 #if !CONFIG_HG_BOARD_ESP32_CYD
     if (const auto ma = g_power.charge_current_ma()) report.set("charge_current_ma", static_cast<unsigned>(*ma));
     if (hgp::board_config().tailnet) g_tailnet.report(report);
+#endif
+#if CONFIG_HG_WAKE_WORD
+    hgp::wake::report(report, app.wake_stats());
 #endif
   };
   app.recent_log = &hgp::diag::recent_log;

@@ -29,14 +29,15 @@ struct FakeMic {
     return true;
   }
   void deliver(const int16_t* chunk) { calls.push_back("deliver " + std::to_string(chunk[0])); }
+  void listen(const int16_t* chunk) { calls.push_back("listen " + std::to_string(chunk[0])); }
   void wait() { calls.push_back("wait"); }
   void pause() { calls.push_back("pause"); }
 };
 
-std::vector<std::string> run(hg::MicPower& power, FakeMic& mic, bool capturing, int turns) {
+std::vector<std::string> run(hg::MicPower& power, FakeMic& mic, bool capturing, int turns, bool listening = false) {
   mic.calls.clear();
   int16_t chunk[4] = {};
-  for (int i = 0; i < turns; ++i) power.turn(capturing, mic, chunk);
+  for (int i = 0; i < turns; ++i) power.turn(capturing, mic, chunk, listening);
   return mic.calls;
 }
 
@@ -95,4 +96,32 @@ TEST("mic power: a codec shared with the speaker stays on and keeps reading, del
   CHECK(run(power, mic, false, 2) == Calls({"read", "read"}));
   CHECK(power.on());
   CHECK(run(power, mic, true, 1) == Calls({"read", "deliver 2"}));
+}
+
+TEST("mic power: listening keeps a recording-only codec on and feeds the detector, not the app") {
+  hg::MicPower power(true);
+  FakeMic mic;
+  run(power, mic, false, 1);
+  CHECK(run(power, mic, false, 3, true) == Calls({"power up", "drain", "read", "read", "listen 1", "read", "listen 2"}));
+  CHECK(power.on());
+}
+
+TEST("mic power: a recording while listening takes the chunks without cycling the codec") {
+  hg::MicPower power(true);
+  FakeMic mic;
+  run(power, mic, false, 2, true);
+  // The core disarms before it records; either way the recording gets every chunk.
+  CHECK(run(power, mic, true, 2, true) == Calls({"read", "deliver 2", "read", "deliver 3"}));
+  CHECK(run(power, mic, true, 1) == Calls({"read", "deliver 4"}));
+  // Recording over and still armed: back to the detector, the codec still on.
+  CHECK(run(power, mic, false, 1, true) == Calls({"read", "listen 5"}));
+  // Disarmed: off as before.
+  CHECK(run(power, mic, false, 1) == Calls({"power down", "wait"}));
+  CHECK(!power.on());
+}
+
+TEST("mic power: a shared codec listening hands its idle chunks to the detector") {
+  hg::MicPower power(false);
+  FakeMic mic;
+  CHECK(run(power, mic, false, 2, true) == Calls({"read", "listen 0", "read", "listen 1"}));
 }

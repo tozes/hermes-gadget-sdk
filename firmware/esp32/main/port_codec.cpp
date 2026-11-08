@@ -242,12 +242,28 @@ void CodecMic::task(void* arg) {
       return true;
     }
     void deliver(const int16_t* chunk) { events::post(EventType::Mic, chunk, kMicChunk * sizeof(int16_t)); }
+    void listen(const int16_t* chunk) {
+#if CONFIG_HG_WAKE_WORD
+      if (mic->sink_) mic->sink_(chunk, kMicChunk);
+#endif
+    }
     void wait() { ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)); }
     void pause() { vTaskDelay(pdMS_TO_TICKS(10)); }
   } ops{self};
   hg::MicPower power(self->link_.switchable);
+#if CONFIG_HG_WAKE_WORD
+  for (;;) power.turn(self->capturing_.load(), ops, pcm, self->listening_.load());
+#else
   for (;;) power.turn(self->capturing_.load(), ops, pcm);
+#endif
 }
+
+#if CONFIG_HG_WAKE_WORD
+void CodecMic::set_listening(bool on) {
+  listening_ = on;
+  if (task_) xTaskNotifyGive(task_);  // wakes a powered-down mic task
+}
+#endif
 
 // --------------------------------------------------------------------------
 // Speaker
