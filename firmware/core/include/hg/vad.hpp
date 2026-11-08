@@ -37,6 +37,11 @@ class Vad {
     // Blocks that end within this long of reset() are neither speech nor noise, nor in level();
     // they still count towards no_speech_ms. For a microphone's start-up pop.
     uint32_t ignore_ms = 0;
+    // For speech close to min_threshold (a wake turn's, from across the room): blocks at or over
+    // min_threshold never raise the noise estimate, so quiet speech can't learn itself away (and
+    // a room louder than min_threshold counts as speech), and the estimate moves with elapsed
+    // time, the same at any block size. Off: it moves a fixed step per block.
+    bool far_field = false;
   };
 
   enum class Result : uint8_t { Continue, EndOfSpeech, NoSpeech };
@@ -47,6 +52,7 @@ class Vad {
   // Enough speech for an utterance: what EndOfSpeech needs, and what NoSpeech lacks.
   bool speech() const { return speech_ms_ >= kMinSpeechMs; }
   VadLevel level() const;
+  const Config& config() const { return cfg_; }
 
  private:
   // A little sustained speech before an end-of-speech can trigger, so a single click

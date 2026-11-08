@@ -696,9 +696,12 @@ class App {
   bool wake_word_ = false, wake_usb_ = false, wake_armed_ = false, wake_pending_ = false;
   uint32_t wake_pending_until_ = 0, wake_detections_ = 0, wake_no_speech_ = 0;
   // The `wake_gain` (dB) and `wake_floor` (RMS) settings, the gain the microphone was last
-  // given (nullopt: the board's own), and what the last wake turn heard.
+  // given (nullopt: the board's own) and what the port said it applies (nullopt: it can't say),
+  // the latter when the recording started and whether it changed since, and what the last wake
+  // turn heard.
   float wake_gain_db_ = 0, wake_floor_ = 0;
-  std::optional<float> mic_gain_;
+  std::optional<float> mic_gain_, mic_gain_applied_, turn_gain_applied_;
+  bool turn_gain_changed_ = false;
   std::optional<VadLevel> wake_last_turn_;
   bool reply_while_face_down_ = false;  // a reply arrived while dark; show it on the turn-over
   uint8_t wake_buttons_ = 0;

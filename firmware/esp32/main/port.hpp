@@ -526,7 +526,7 @@ class CodecMic final : public hg::AudioIn {
   // handle, so it writes the new gain itself, between two reads: a chunk is never read across
   // the change, and the chunks after it carry what the I2S DMA already held (up to its buffer,
   // tens of ms) at the old gain. A powered-down ADC gets it when it powers up.
-  void set_gain_db(std::optional<float> db) override;
+  std::optional<float> set_gain_db(std::optional<float> db) override;
 #endif
 
  private:

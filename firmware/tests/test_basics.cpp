@@ -211,6 +211,66 @@ TEST("vad: speech followed by silence ends the utterance") {
   CHECK(r == hg::Vad::Result::EndOfSpeech);
 }
 
+namespace {
+
+// Feeds `ms` of a square wave at `amp` in blocks of `block` samples; the last block's result.
+hg::Vad::Result vad_feed(hg::Vad& vad, uint32_t rate, size_t block, int16_t amp, uint32_t ms) {
+  std::vector<int16_t> pcm(block);
+  for (size_t i = 0; i < block; ++i) pcm[i] = (i / 8) % 2 ? amp : static_cast<int16_t>(-amp);
+  hg::Vad::Result r = hg::Vad::Result::Continue;
+  for (uint32_t t = 0; t < ms * rate / 1000 && r == hg::Vad::Result::Continue; t += static_cast<uint32_t>(block))
+    r = vad.feed(pcm.data(), pcm.size());
+  return r;
+}
+
+}  // namespace
+
+TEST("vad: tap turns adapt a step per block, as before far_field: 13 ms and 100 ms blocks differ") {
+  struct Case {
+    uint32_t rate;
+    size_t block;
+    int16_t amp;
+    uint32_t speech_ms;
+    hg::Vad::Result end;
+  };
+  // Speech from the first block, just over the floor of 150 and well over it.
+  for (const Case c : {Case{24000, 320, 160, 78, hg::Vad::Result::NoSpeech}, Case{16000, 1600, 160, 600, hg::Vad::Result::EndOfSpeech},
+                       Case{24000, 320, 600, 819, hg::Vad::Result::EndOfSpeech}, Case{16000, 1600, 600, 1000, hg::Vad::Result::EndOfSpeech}}) {
+    hg::Vad vad;
+    hg::Vad::Config cfg;
+    cfg.sample_rate = c.rate;
+    cfg.min_threshold = 150;
+    vad.reset(cfg);
+    vad_feed(vad, c.rate, c.block, c.amp, 1000);
+    CHECK_EQ(vad.level().speech_ms, c.speech_ms);
+    CHECK(vad_feed(vad, c.rate, c.block, 10, 7000) == c.end);
+  }
+}
+
+TEST("vad: far_field keeps speech over the floor out of the noise, and adapts by time, the same at any block size") {
+  struct Case {
+    uint32_t rate;
+    size_t block;
+    uint32_t three_s;  // what the VAD counts of 3 s of blocks (13 ms each for a 13.3 ms block)
+  };
+  for (const Case c : {Case{24000, 320, 225 * 13}, Case{16000, 1600, 3000}}) {
+    hg::Vad::Config cfg;
+    cfg.sample_rate = c.rate;
+    cfg.min_threshold = 150;
+    cfg.far_field = true;
+    hg::Vad vad;
+    vad.reset(cfg);
+    vad_feed(vad, c.rate, c.block, 160, 3000);  // three seconds of quiet speech: all of it counts
+    CHECK_EQ(vad.level().speech_ms, c.three_s);
+    vad.reset(cfg);
+    vad_feed(vad, c.rate, c.block, 120, 2000);  // noise under the floor: two seconds lift the threshold
+    vad_feed(vad, c.rate, c.block, 220, 500);   // to about 260
+    CHECK_EQ(vad.level().speech_ms, 0u);
+    vad_feed(vad, c.rate, c.block, 300, 500);
+    CHECK(vad.level().speech_ms >= 400u);
+  }
+}
+
 TEST("vad: silence alone gives up") {
   hg::Vad vad;
   hg::Vad::Config cfg;

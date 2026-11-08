@@ -55,7 +55,14 @@ Vad::Result Vad::feed(const int16_t* samples, size_t count) {
   // Track the noise floor quickly downwards, slowly upwards. It starts at the
   // quiet end so speech that begins with the first block is still detected.
   if (noise_ == 0) noise_ = cfg_.min_threshold / cfg_.noise_ratio;
-  noise_ = r < noise_ ? noise_ * 0.7f + r * 0.3f : noise_ * 0.995f + r * 0.005f;
+  if (!cfg_.far_field) {
+    noise_ = r < noise_ ? noise_ * 0.7f + r * 0.3f : noise_ * 0.995f + r * 0.005f;
+  } else if (r < noise_ || r < cfg_.min_threshold) {
+    // Time constants of about those steps at the 1.75C's 13.3 ms blocks.
+    const float tau_ms = r < noise_ ? 40.0f : 2700.0f;
+    const float block_ms = static_cast<float>(count) * 1000.0f / static_cast<float>(cfg_.sample_rate);
+    noise_ += (r - noise_) * (1.0f - std::exp(-block_ms / tau_ms));
+  }
 
   float threshold = noise_ * cfg_.noise_ratio;
   if (threshold < cfg_.min_threshold) threshold = cfg_.min_threshold;

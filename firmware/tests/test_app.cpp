@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "check.hpp"
+#include "es7210_gain.hpp"
 #include "hg/app.hpp"
 #include "hg/crypto.hpp"
 #include "hg/protocol.hpp"
@@ -151,9 +152,10 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
     return mic_on = true;
   }
   void stop() override { mic_on = false; }
-  void set_gain_db(std::optional<float> db) override {
+  std::optional<float> set_gain_db(std::optional<float> db) override {  // an ES7210 at 24 dB
     mic_gain = db;
     ++mic_gain_calls;
+    return db ? hg::es7210_gain_step(*db) : 24.0f;
   }
 
   // Speaker
@@ -9100,6 +9102,26 @@ struct WakeRig : Rig {
       advance(100);
     }
   }
+  // `chunks` of the 1.75C's own size (320 samples at 24 kHz, 13.3 ms; production_profile()) at
+  // `amp`, the clock kept to the audio's time.
+  void feed_chunks(int16_t amp, int chunks) {
+    std::vector<int16_t> pcm(320);
+    for (size_t i = 0; i < pcm.size(); ++i) pcm[i] = (i / 8) % 2 ? amp : static_cast<int16_t>(-amp);
+    for (int i = 0; i < chunks && fake.mic_on; ++i) {
+      app.on_mic_samples(pcm.data(), pcm.size());
+      chunk_samples += pcm.size();
+      const uint32_t ticks = (static_cast<uint32_t>(chunk_samples * 1000 / 24000) - clock_ms) / 10 * 10;
+      advance(ticks);  // in its 10 ms ticks
+      clock_ms += ticks;
+    }
+  }
+  uint64_t chunk_samples = 0;
+  uint32_t clock_ms = 0;  // what feed_chunks has advanced the clock by
+  static hg::DeviceProfile production_profile() {
+    hg::DeviceProfile p = wake_profile();
+    p.mic_rate = 24000;
+    return p;
+  }
   bool indicator() const {
     return app.screen() == hg::Screen::Ready && app.model().hint == "Listening for \"Hey Hermes\"";
   }
@@ -9677,7 +9699,78 @@ TEST("wake: quiet far speech after the pop is heard, and the pause after it ends
   CHECK(turn && turn->rms_mean == 200.0f && turn->rms_max == 240.0f && turn->peak == 240);
   CHECK(std::find(r.fake.logs.begin(), r.fake.logs.end(),
                   "wake turn: heard speech, 1000 ms of speech blocks, block RMS mean 200 max 240, peak 240 "
-                  "(floor 150, wake_gain 30.0 dB)") != r.fake.logs.end());
+                  "(floor 150, mic gain 30.0 dB)") != r.fake.logs.end());
+}
+
+// The 1.75C hands over 13.3 ms chunks; the VAD's ignored 300 ms ends with its 23rd (elapsed 299 ms).
+TEST("wake: at the 1.75C's chunks, a pop through 250 ms or up to the 300 ms mark counts for nothing") {
+  for (const int pop : {19, 22}) {  // 253 ms, 293 ms
+    WakeRig r(WakeRig::production_profile());
+    r.arm();
+    start_wake_turn(r);
+    r.feed_chunks(1500, pop);
+    r.feed_chunks(10, 600);  // nobody speaks, to the no-speech limit
+    CHECK(!r.fake.mic_on);
+    CHECK(r.fake.last("audio.end") == nullptr);
+    const Value* cancel = r.fake.last("audio.cancel");
+    CHECK(cancel && (*cancel)["reason"].as_string() == "no speech");
+    CHECK_EQ(r.app.wake_stats().no_speech, uint32_t(1));
+    const auto turn = r.app.wake_stats().last_turn;
+    CHECK(turn && turn->speech_ms == 0);
+    CHECK(turn && turn->rms_max == 10.0f && turn->peak == 10);
+  }
+}
+
+TEST("wake: at the 1.75C's chunks, quiet speech from the VAD's first block after the pop window is heard and sent") {
+  struct Start {
+    int pop, gap;  // chunks of pop, then of silence: 23 in all
+  };
+  for (const int16_t amp : {160, 180})  // just over the floor of 150
+    for (const Start s : {Start{19, 4}, Start{22, 1}}) {
+      WakeRig r(WakeRig::production_profile());
+      r.arm();
+      start_wake_turn(r);
+      r.feed_chunks(1500, s.pop);
+      r.feed_chunks(10, s.gap);
+      r.feed_chunks(amp, 75);  // a second of speech
+      CHECK(r.fake.mic_on);
+      r.feed_chunks(10, 90);  // the pause
+      CHECK(!r.fake.mic_on);
+      CHECK(r.fake.last("audio.end") != nullptr);
+      CHECK(r.fake.last("audio.cancel") == nullptr);
+      const auto turn = r.app.wake_stats().last_turn;
+      CHECK(turn && turn->speech);
+      CHECK(turn && turn->speech_ms == 75 * 13);  // every speech block: none learnt as noise
+      CHECK(turn && turn->rms_max == static_cast<float>(amp));
+    }
+}
+
+TEST("wake: a turn's log gives the floor it used and the gain the microphone applied, and a gain change in it") {
+  WakeRig r;
+  r.arm();
+  CHECK_EQ(r.app.console("set wake_gain 33"), std::string("@ok wake_gain"));  // the ES7210 sets 30
+  start_wake_turn(r);
+  r.feed(10, 4);
+  CHECK_EQ(r.app.console("set wake_floor 1000"), std::string("@ok wake_floor"));  // from the next turn
+  r.feed(240, 10);
+  CHECK_EQ(r.app.console("set wake_gain 36"), std::string("@ok wake_gain"));
+  r.feed(10, 12);
+  CHECK(!r.fake.mic_on);
+  CHECK(r.fake.last("audio.end") != nullptr);  // heard over its floor of 150
+  auto logged = [&](const std::string& part) {
+    return std::any_of(r.fake.logs.begin(), r.fake.logs.end(), [&](const std::string& l) {
+      return l.rfind("wake turn: ", 0) == 0 && l.find(part) != std::string::npos;
+    });
+  };
+  CHECK(logged("(floor 150, mic gain 30.0 dB, then 36.0 dB from mid-turn)"));
+  answer_turn(r);
+
+  start_wake_turn(r);
+  r.feed(10, 4);
+  r.feed(240, 60);  // under the new floor
+  const Value* cancel = r.fake.last("audio.cancel");
+  CHECK(cancel && (*cancel)["reason"].as_string() == "no speech");
+  CHECK(logged("(floor 1000, mic gain 36.0 dB)"));
 }
 
 TEST("wake: a tap turn keeps the board's floor and counts its start, with a low wake_floor") {

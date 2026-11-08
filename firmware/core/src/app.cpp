@@ -76,8 +76,10 @@ constexpr uint32_t kWakeStartIgnoreMs = 300;
 // goes to 37.5 dB; a port rounds down to its codec's steps (AudioIn::set_gain_db).
 constexpr float kWakeGainDb = 30.0f, kWakeGainMaxDb = 37.5f;
 // `wake_floor`, a wake turn's quietest speech block (RMS), instead of the board's close-talk
-// DeviceProfile::vad_min_rms; the VAD's noise ratio still raises it in a noisy room. 150 at
+// DeviceProfile::vad_min_rms; noise under it still raises the VAD's threshold, but a room louder
+// than the floor counts as speech (Vad::Config::far_field), so set it over the room. 150 at
 // 30 dB: 3 times a quiet room (6-25 at 24 dB, so up to 50), and under speech at 1 m (150-515).
+// A turn keeps the floor it started with (Vad::Config); a new one applies from the next turn.
 constexpr float kWakeFloorRms = 150.0f, kWakeFloorMinRms = 30.0f, kWakeFloorMaxRms = 3000.0f;
 constexpr size_t kOtaAckBytes = 16 * 1024;  // a firmware update acknowledges every 16 KB written
 constexpr uint32_t kOtaIdleMs = 30000;      // ...and is abandoned when no data comes for this long
@@ -1671,6 +1673,8 @@ void App::start_listening(bool hands_free, bool wake) {
   wake_pending_ = false;  // a press during a wake's beep takes over
   set_wake_armed(false);  // the detector lets go of the microphone first
   set_mic_gain(wake);     // then the recording's gain, before its first chunk
+  turn_gain_applied_ = mic_gain_applied_;
+  turn_gain_changed_ = false;
   if (!hal_.mic || !hal_.mic->start(profile_.mic_rate)) {
     set_hint_flash(tr(i18n::Msg::MicUnavailable));
     return;
@@ -1692,6 +1696,7 @@ void App::start_listening(bool hands_free, bool wake) {
   if (wake) {  // far-field, at the wake gain, after the microphone's start-up pop
     vc.min_threshold = wake_floor_;
     vc.ignore_ms = kWakeStartIgnoreMs;
+    vc.far_field = true;
   }
   vad_.reset(vc);
   rec_on_ = rec_.ready();
@@ -1802,20 +1807,28 @@ void App::set_mic_gain(bool wake) {
   const std::optional<float> db = wake ? std::optional<float>(wake_gain_db_) : std::nullopt;
   if (db == mic_gain_) return;
   mic_gain_ = db;
-  hal_.mic->set_gain_db(db);
+  const std::optional<float> applied = hal_.mic->set_gain_db(db);
+  if (mode_ == Mode::Listening && applied != mic_gain_applied_) turn_gain_changed_ = true;
+  mic_gain_applied_ = applied;
 }
 
 void App::note_turn_level() {
   if (!hands_free_) return;  // no VAD ran
   const VadLevel l = vad_.level();
   if (wake_turn_) wake_last_turn_ = l;
-  char gain[32] = "";
-  if (wake_turn_) std::snprintf(gain, sizeof gain, ", wake_gain %.1f dB", static_cast<double>(wake_gain_db_));
-  char line[176];
+  // What the turn ran with: the floor it started with (a `wake_floor` set since is for the next
+  // one), and the gain the microphone applied, then whatever it got in the middle of the turn.
+  char gain[64] = "";
+  if (wake_turn_ && turn_gain_applied_) {
+    const size_t n = static_cast<size_t>(std::snprintf(gain, sizeof gain, ", mic gain %.1f dB", static_cast<double>(*turn_gain_applied_)));
+    if (turn_gain_changed_ && mic_gain_applied_)
+      std::snprintf(gain + n, sizeof gain - n, ", then %.1f dB from mid-turn", static_cast<double>(*mic_gain_applied_));
+  }
+  char line[208];
   std::snprintf(line, sizeof line, "%s turn: %s, %u ms of speech blocks, block RMS mean %.0f max %.0f, peak %d (floor %.0f%s)",
                 wake_turn_ ? "wake" : "tap", l.speech ? "heard speech" : "no speech", static_cast<unsigned>(l.speech_ms),
                 static_cast<double>(l.rms_mean), static_cast<double>(l.rms_max), l.peak,
-                static_cast<double>(wake_turn_ ? wake_floor_ : profile_.vad_min_rms), gain);
+                static_cast<double>(vad_.config().min_threshold), gain);
   log(LogLevel::Info, line);
 }
 

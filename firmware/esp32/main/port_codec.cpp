@@ -287,11 +287,12 @@ void CodecMic::set_listening(bool on) {
   if (task_) xTaskNotifyGive(task_);  // wakes a powered-down mic task
 }
 
-void CodecMic::set_gain_db(std::optional<float> db) {
+std::optional<float> CodecMic::set_gain_db(std::optional<float> db) {
   const float gain = db ? hg::es7210_gain_step(*db) : link_.gain_db;
   gain_db_ = gain;
   if (db) ESP_LOGI(TAG, "microphone gain %.1f dB (wake_gain %.1f)", static_cast<double>(gain), static_cast<double>(*db));
   else ESP_LOGI(TAG, "microphone gain %.1f dB (the board's)", static_cast<double>(gain));
+  return gain;
 }
 #endif
 
