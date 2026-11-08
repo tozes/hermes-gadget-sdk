@@ -138,6 +138,80 @@ def test_voice_is_uploaded_as_wav_and_played_back(devserver, make_sim):
     assert sim.speaker.last_file is not None and sim.speaker.last_file.stat().st_size > 20000
 
 
+def _raw_turn(url: str, caps: dict, mode: str, pcm: bytes) -> list[dict]:
+    """Connect a hand-made device with ``caps``, speak ``pcm`` as one ``mode`` utterance, and return
+    what the server sent from audio.start up to the turn.end."""
+    import base64
+    import secrets
+
+    from websockets.sync.client import connect
+
+    from hermes_gadget_plugin import protocol
+
+    key = secrets.token_bytes(32)
+    device_id = protocol.device_id_for_key(key)
+    with connect(url, subprotocols=["hermes-gadget.v1"]) as ws:
+        ws.send(json.dumps({"type": "hello", "proto": 1, "device_id": device_id, "name": "x", "caps": caps}))
+        json.loads(ws.recv(timeout=5))  # challenge
+        ws.send(json.dumps({"type": "auth", "key": base64.b64encode(key).decode()}))
+        while json.loads(ws.recv(timeout=5)).get("type") != "welcome":
+            pass
+        ws.send(json.dumps({"type": "audio.start", "id": "a1", "stream": 1, "rate": 16000,
+                            "format": "pcm16", "mode": mode}))
+        for seq, at in enumerate(range(0, len(pcm), 640)):
+            ws.send(protocol.binary(protocol.CHANNEL_AUDIO, 1, seq, pcm[at:at + 640]))
+        ws.send(json.dumps({"type": "audio.end", "id": "a1", "stream": 1}))
+        received = []
+        while not received or received[-1].get("type") != "turn.end":
+            raw = ws.recv(timeout=10)
+            if isinstance(raw, str):
+                received.append(json.loads(raw))
+        return received
+
+
+def _replies(received: list[dict]) -> list[str]:
+    return [m["text"] for m in received if m.get("type") in ("reply", "notice")]
+
+
+def test_a_wake_word_utterance_is_delivered_like_a_tap_one(devserver, caplog):
+    import logging
+
+    hub, brain, url = devserver()
+    heard = []
+    on_utterance = brain.on_utterance
+
+    async def record(session, msg_id, wav, seconds):
+        heard.append((session.caps.get("wake"), msg_id, wav, seconds))
+        await on_utterance(session, msg_id, wav, seconds)
+
+    brain.on_utterance = record
+    pcm = _tone(0.8)
+    with caplog.at_level(logging.INFO, logger="hermes_gadget.hub"):
+        tap = _replies(_raw_turn(url, {"inputs": ["talk", "touch"], "talk_mode": "tap"}, "tap", pcm))
+        assert "started by the wake word" not in caplog.text
+        wake = _replies(_raw_turn(url, {"inputs": ["talk", "touch"], "talk_mode": "tap",
+                                        "wake": {"phrase": "Hey Hermes"}}, "wake", pcm))
+    assert wake == tap and "I heard 0.8 seconds" in wake[0]
+    (no_caps, *tapped), (wake_caps, *woken) = heard
+    assert no_caps is None and wake_caps == {"phrase": "Hey Hermes"}
+    assert woken == tapped  # the same id, WAV bytes and duration reach the delegate
+    assert any(r.levelno == logging.INFO and "recording a1 started by the wake word" in r.getMessage()
+               and r.getMessage().startswith("device hg-") for r in caplog.records)
+
+
+@pytest.mark.parametrize("caps, mode, notice", [
+    ({"inputs": ["talk"], "wake": {"phrase": "Hey Hermes"}}, "wake", "Didn't catch that - say \"Hey Hermes\" and speak"),
+    ({"inputs": ["talk"], "wake": {}}, "wake", "Didn't catch that - tap and speak"),
+    ({"inputs": ["talk"]}, "wake", "Didn't catch that - tap and speak"),
+    ({"inputs": ["talk"], "wake": {"phrase": "Hey Hermes"}}, "hold", "Didn't catch that - hold the button while speaking"),
+])
+def test_a_too_short_wake_word_utterance_names_the_phrase(devserver, caps, mode, notice):
+    _hub, _brain, url = devserver()
+    received = _raw_turn(url, caps, mode, _tone(0.1))
+    assert _replies(received) == [notice]
+    assert received[-1]["outcome"] == "cancelled"
+
+
 def test_a_recording_survives_a_lost_connection_and_is_sent_after_reconnecting(loop_thread, devserver, make_sim):
     hub, _brain, url = devserver()
     sim = make_sim(url)
