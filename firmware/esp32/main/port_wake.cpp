@@ -1,7 +1,11 @@
-// Wake-word detector (CONFIG_HG_WAKE_WORD, spike): 16 kHz PCM -> TFLM micro frontend
-// (40 features per 30 ms window, 10 ms step) -> streaming microWakeWord model ->
-// mean of the last N probabilities against the model's cutoff. Nothing feeds it the
-// microphone yet; the console's `wake-test` runs it on a built-in clip.
+// The wake word detector (CONFIG_HG_WAKE_WORD). While the core arms it (hg::WakeWord), the
+// codec microphone's mic task hands it every 24 kHz chunk through a stream buffer instead of
+// posting them to the app (CodecMic::set_listening). Its own task resamples them to 16 kHz
+// (hg::Resample3to2), runs TensorFlow Lite Micro's audio frontend (40 features per 30 ms
+// window, 10 ms step) and the streaming microWakeWord model (one inference per 3 steps), and
+// a mean of the last N probabilities above the model's cutoff (hg::WakeWindow) posts one
+// EventType::Wake. The model, its phrase, cutoff, window and arena come from the sdkconfig
+// (CONFIG_HG_WAKE_WORD_MODEL and its values, taken from the model's manifest).
 #include "port.hpp"  // first: pulls in FreeRTOS.h ahead of task.h/queue.h
 
 #include "sdkconfig.h"
@@ -11,7 +15,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <new>
 
 #include "esp_console.h"
@@ -21,10 +24,12 @@
 #include "freertos/task.h"
 #include "frontend.h"
 #include "frontend_util.h"
+#include "resample.hpp"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_resource_variable.h"
 #include "tensorflow/lite/micro/schema/schema_generated.h"
+#include "wake_window.hpp"
 
 namespace hgp::wake {
 namespace {
@@ -32,24 +37,18 @@ namespace {
 const char* TAG = "hg.wake";
 
 constexpr int kSampleRate = 16000;
-constexpr size_t kChunk = kSampleRate / 100;  // 10 ms, one feature step
 constexpr int kFeatures = 40;
+constexpr int kStepMs = 10;  // one feature row
 // The frontend's uint16 outputs are scaled by this before quantising: microWakeWord's
 // training features are the same outputs as floats (pymicro-features does the same).
 constexpr float kFeatureScale = 0.0390625f;
-constexpr int kMaxWindow = 10;
-
-// One model and its manifest (micro.* in the model's JSON). The arena is the
-// manifest's tensor_arena_size, which also holds the streaming state variables.
-struct ModelSpec {
-  const char* name;
-  const uint8_t* data;
-  const int16_t* clip;
-  size_t clip_samples;
-  float cutoff;
-  int window;
-  size_t arena;
-};
+constexpr int kRefractoryMs = 2000;  // after a detection, before the next can count
+// Audio from the mic task, 24 kHz: 0.5 s, in PSRAM. Read in 20 ms pieces.
+constexpr size_t kAudioBuffer = 24000;
+constexpr size_t kReadSamples = 480;
+// Inference runs on this stack, in internal RAM (TFLM's kernels keep their scratch there).
+// ponytail: not measured on the board; `diag` `stacks` shows hg-wake's free bytes to trim it.
+constexpr uint32_t kTaskStack = 8192;
 
 // Puts wake/<file> in flash as <sym>_start .. <sym>_end, 16-byte aligned as TFLM
 // wants its model. HG_WAKE_DIR comes from CMakeLists.txt.
@@ -60,49 +59,24 @@ struct ModelSpec {
   extern const uint8_t sym##_start[] asm(#sym "_start");                                  \
   extern const uint8_t sym##_end[] asm(#sym "_end");
 
-#if CONFIG_HG_WAKE_WORD_HEY_HERMES
-HG_INCBIN(hey_hermes_tflite, "hey_hermes.tflite")
-#if CONFIG_HG_WAKE_WORD_TEST_CLIPS
-HG_INCBIN(hey_hermes_clip, "hey_hermes_test.pcm")
-#endif
-#endif
-#if CONFIG_HG_WAKE_WORD_HEY_JARVIS
-HG_INCBIN(hey_jarvis_tflite, "hey_jarvis.tflite")
-#if CONFIG_HG_WAKE_WORD_TEST_CLIPS
-HG_INCBIN(hey_jarvis_clip, "hey_jarvis_test.pcm")
-#endif
+HG_INCBIN(hg_wake_model, CONFIG_HG_WAKE_WORD_MODEL ".tflite")
+#if CONFIG_HG_WAKE_WORD_TEST_CLIP
+HG_INCBIN(hg_wake_clip, CONFIG_HG_WAKE_WORD_MODEL "_test.pcm")
 #endif
 
-#if CONFIG_HG_WAKE_WORD_TEST_CLIPS
-#define HG_CLIP(name) reinterpret_cast<const int16_t*>(name##_clip_start), \
-                      size_t(name##_clip_end - name##_clip_start) / 2
-#else
-#define HG_CLIP(name) nullptr, 0
-#endif
-
-// hey-hermes.json (miketomkins/hey-hermes-wakeword-model) and hey_jarvis.json
-// (esphome/micro-wake-word-models models/v2).
-const ModelSpec kModels[] = {
-#if CONFIG_HG_WAKE_WORD_HEY_HERMES
-    {"hermes", hey_hermes_tflite_start, HG_CLIP(hey_hermes), 0.32f, 5, 65536},
-#endif
-#if CONFIG_HG_WAKE_WORD_HEY_JARVIS
-    {"jarvis", hey_jarvis_tflite_start, HG_CLIP(hey_jarvis), 0.97f, 5, 22860},
-#endif
-};
-
-// The operators both models use (checked with the LiteRT interpreter on the host).
+// The operators the built-in models use (checked with the LiteRT interpreter on the host;
+// SPLIT_V is Hey Hermes only).
 using Resolver = tflite::MicroMutableOpResolver<13>;
 
-class Detector {
+// TFLM's frontend and the streaming model, from 16 kHz samples to probabilities.
+class Model {
  public:
   // Allocates everything once: the arena in PSRAM, the interpreter and the frontend.
-  bool begin(const ModelSpec& spec) {
-    spec_ = &spec;
+  bool begin() {
     FrontendConfig fc;
     FrontendFillConfigWithDefaults(&fc);
     fc.window.size_ms = 30;
-    fc.window.step_size_ms = 10;
+    fc.window.step_size_ms = kStepMs;
     fc.filterbank.num_channels = kFeatures;
     fc.filterbank.lower_band_limit = 125.0f;
     fc.filterbank.upper_band_limit = 7500.0f;
@@ -117,7 +91,7 @@ class Detector {
     fc.log_scale.enable_log = 1;
     fc.log_scale.scale_shift = 6;
     if (!FrontendPopulateState(&fc, &frontend_, kSampleRate)) {
-      ESP_LOGE(TAG, "%s: frontend setup failed", spec.name);
+      ESP_LOGE(TAG, "frontend setup failed");
       return false;
     }
     resolver_.AddVarHandle();
@@ -134,24 +108,24 @@ class Detector {
     resolver_.AddSplitV();
     resolver_.AddStridedSlice();
 
-    arena_ = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, spec.arena, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!arena_) {
-      ESP_LOGE(TAG, "%s: no PSRAM for a %u B arena", spec.name, unsigned(spec.arena));
+    constexpr size_t arena = CONFIG_HG_WAKE_WORD_ARENA;
+    uint8_t* mem = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!mem) {
+      ESP_LOGE(TAG, "no PSRAM for a %u B arena", unsigned(arena));
       return false;
     }
-    const tflite::Model* model = tflite::GetModel(spec.data);
-    tflite::MicroAllocator* alloc = tflite::MicroAllocator::Create(arena_, spec.arena);
+    tflite::MicroAllocator* alloc = tflite::MicroAllocator::Create(mem, arena);
     tflite::MicroResourceVariables* vars = tflite::MicroResourceVariables::Create(alloc, 20);
-    interp_ = new (std::nothrow) tflite::MicroInterpreter(model, resolver_, alloc, vars);
+    interp_ = new (std::nothrow) tflite::MicroInterpreter(tflite::GetModel(hg_wake_model_start), resolver_, alloc, vars);
     if (!interp_ || interp_->AllocateTensors() != kTfLiteOk) {
-      ESP_LOGE(TAG, "%s: AllocateTensors failed (arena %u B)", spec.name, unsigned(spec.arena));
+      ESP_LOGE(TAG, "AllocateTensors failed (arena %u B)", unsigned(arena));
       return false;
     }
     TfLiteTensor* in = interp_->input(0);
     TfLiteTensor* out = interp_->output(0);
     if (in->type != kTfLiteInt8 || in->dims->size != 3 || in->dims->data[2] != kFeatures ||
-        out->type != kTfLiteUInt8 || spec.window > kMaxWindow) {
-      ESP_LOGE(TAG, "%s: unexpected model tensors", spec.name);
+        out->type != kTfLiteUInt8) {
+      ESP_LOGE(TAG, "unexpected model tensors");
       return false;
     }
     stride_ = in->dims->data[1];
@@ -159,24 +133,25 @@ class Detector {
     in_zero_ = in->params.zero_point;
     out_scale_ = out->params.scale;
     out_zero_ = out->params.zero_point;
-    ESP_LOGI(TAG, "%s: stride %d, arena %u of %u B", spec.name, stride_, unsigned(interp_->arena_used_bytes()),
-             unsigned(spec.arena));
+    ESP_LOGI(TAG, "%s: stride %d, arena %u of %u B (PSRAM)", CONFIG_HG_WAKE_WORD_MODEL, stride_,
+             unsigned(interp_->arena_used_bytes()), unsigned(arena));
     return true;
   }
 
-  // Clears the audio and model state and the statistics (not on the audio path).
+  // Milliseconds of audio per probability.
+  int ms_per_inference() const { return stride_ * kStepMs; }
+
+  // Clears the audio and model streaming state.
   void reset() {
     FrontendReset(&frontend_);
     interp_->Reset();
-    frames_ = filled_ = 0;
-    detected_ = false;
-    max_p_ = max_mean_ = 0;
-    invokes_ = invoke_us_total_ = invoke_us_max_ = detect_invoke_ = 0;
+    frames_ = 0;
   }
 
-  // Feeds 16 kHz samples. Allocation-free. Returns true once the window mean first
-  // crosses the cutoff since reset().
-  bool feed(const int16_t* pcm, size_t n) {
+  // Feeds 16 kHz samples and calls on_probability(p) after each inference. Allocation-free.
+  // False if an inference failed.
+  template <class F>
+  bool feed(const int16_t* pcm, size_t n, F&& on_probability) {
     while (n) {
       size_t read = 0;
       FrontendOutput fo = FrontendProcessSamples(&frontend_, pcm, n, &read);
@@ -191,104 +166,196 @@ class Detector {
       if (++frames_ < stride_) continue;
       frames_ = 0;
       const int64_t t0 = esp_timer_get_time();
-      if (interp_->Invoke() != kTfLiteOk) {
-        ESP_LOGE(TAG, "%s: Invoke failed", spec_->name);
-        return false;
-      }
+      if (interp_->Invoke() != kTfLiteOk) return false;
       const uint32_t us = uint32_t(esp_timer_get_time() - t0);
       ++invokes_;
       invoke_us_total_ += us;
-      if (us > invoke_us_max_) invoke_us_max_ = us;
-      const float p = (float(interp_->output(0)->data.uint8[0]) - out_zero_) * out_scale_;
-      if (p > max_p_) max_p_ = p;
-      window_[filled_ % spec_->window] = p;
-      if (++filled_ < spec_->window) continue;
-      float sum = 0;
-      for (int i = 0; i < spec_->window; ++i) sum += window_[i];
-      const float mean = sum / spec_->window;
-      if (mean > max_mean_) max_mean_ = mean;
-      if (!detected_ && mean > spec_->cutoff) {
-        detected_ = true;
-        detect_invoke_ = invokes_;
-        return true;
-      }
+      if (us > invoke_us_max_.load(std::memory_order_relaxed)) invoke_us_max_.store(us, std::memory_order_relaxed);
+      invoke_us_mean_.store(uint32_t(invoke_us_total_ / invokes_), std::memory_order_relaxed);
+      on_probability((float(interp_->output(0)->data.uint8[0]) - out_zero_) * out_scale_);
     }
-    return false;
+    return true;
   }
 
-  const ModelSpec* spec_ = nullptr;
-  float max_p_ = 0, max_mean_ = 0;
-  uint32_t invokes_ = 0, invoke_us_total_ = 0, invoke_us_max_ = 0, detect_invoke_ = 0;
-  int stride_ = 0;
+  // Inference time since boot, for `diag` (written here, read by the app task).
+  std::atomic<uint32_t> invoke_us_mean_{0}, invoke_us_max_{0};
 
  private:
   FrontendState frontend_{};
   Resolver resolver_;
-  uint8_t* arena_ = nullptr;
   tflite::MicroInterpreter* interp_ = nullptr;
   float in_scale_ = 1, out_scale_ = 1;
   int in_zero_ = 0, out_zero_ = 0;
-  int frames_ = 0, filled_ = 0;
-  bool detected_ = false;
-  float window_[kMaxWindow] = {};
+  int stride_ = 1, frames_ = 0;
+  uint32_t invokes_ = 0;
+  uint64_t invoke_us_total_ = 0;
 };
 
-constexpr size_t kModelCount = sizeof(kModels) / sizeof(kModels[0]);
-Detector* g_detectors[kModelCount] = {};
+// The port's hg::WakeWord: arming switches the mic task's capture and restarts the detector.
+class Detector final : public hg::WakeWord {
+ public:
+  bool begin(CodecMic& mic) {
+    if (!model_.begin()) return false;
+    window_ = hg::WakeWindow(CONFIG_HG_WAKE_WORD_CUTOFF_PCT / 100.0f, CONFIG_HG_WAKE_WORD_WINDOW,
+                             kRefractoryMs / model_.ms_per_inference());
+    uint8_t* storage = static_cast<uint8_t*>(heap_caps_malloc(kAudioBuffer + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    static StaticStreamBuffer_t control;
+    audio_ = storage ? xStreamBufferCreateStatic(kAudioBuffer, 1, storage, &control) : nullptr;
+    if (!audio_ || xTaskCreate(&Detector::task, "hg-wake", kTaskStack, this, 3, nullptr) != pdPASS) {
+      ESP_LOGE(TAG, "no memory for the detector's audio buffer or task");
+      return false;
+    }
+    mic_ = &mic;
+    mic.set_sink(&Detector::sink);
+    ESP_LOGI(TAG, "ready: \"%s\", cutoff %d%%, window %d", CONFIG_HG_WAKE_WORD_PHRASE, CONFIG_HG_WAKE_WORD_CUTOFF_PCT,
+             window_.window());
+    return true;
+  }
 
-void run_test(void* arg) {
-  const size_t m = reinterpret_cast<size_t>(arg);
-  const ModelSpec& spec = kModels[m];
-  Detector*& d = g_detectors[m];
-  if (!d) {
-    d = new (std::nothrow) Detector();
-    if (!d || !d->begin(spec)) {
-      std::printf("@error wake: %s did not start (see log)\n", spec.name);
-      vTaskDelete(nullptr);
-      return;
+  void set_armed(bool armed) override {
+    if (armed) restart_ = true;  // before the first chunk arrives
+    armed_ = armed;
+    mic_->set_listening(armed);
+    ESP_LOGI(TAG, "%s", armed ? "armed" : "disarmed");
+  }
+
+  void report(hg::json::Value& wake) const {
+    wake.set("last_peak", static_cast<double>(last_peak_.load()))
+        .set("invoke_us_mean", static_cast<unsigned>(model_.invoke_us_mean_.load()))
+        .set("invoke_us_max", static_cast<unsigned>(model_.invoke_us_max_.load()))
+        .set("model", CONFIG_HG_WAKE_WORD_MODEL);
+  }
+
+  // `wake-test`: runs on the detector's task, between chunks.
+  void request_test() { test_ = true; }
+
+  static Detector* instance;
+
+ private:
+  // On the mic task: whatever doesn't fit is dropped (the detector fell 0.5 s behind).
+  static void sink(const int16_t* pcm, size_t samples) {
+    xStreamBufferSend(instance->audio_, pcm, samples * sizeof(int16_t), 0);
+  }
+
+  static void task(void* arg) {
+    auto* self = static_cast<Detector*>(arg);
+    int16_t in[kReadSamples];
+    int16_t pcm[hg::Resample3to2::max_out(kReadSamples)];
+    for (;;) {
+      // A second without audio (disarmed) still comes round for `wake-test`.
+      const size_t got = xStreamBufferReceive(self->audio_, in, sizeof(in), pdMS_TO_TICKS(1000));
+      if (self->test_.exchange(false)) self->run_test();
+      if (self->restart_.exchange(false)) {
+        // (Re)armed, or after a test: start from silence, not from audio left over.
+        xStreamBufferReset(self->audio_);
+        self->resampler_.reset();
+        self->model_.reset();
+        self->window_.reset();
+        continue;
+      }
+      if (got < sizeof(int16_t)) continue;
+      const size_t n = self->resampler_.process(in, got / sizeof(int16_t), pcm);
+      bool detected = false;
+      const bool ok = self->model_.feed(pcm, n, [self, &detected](float p) {
+        if (self->window_.push(p)) detected = true;
+      });
+      if (!ok && !self->failed_) ESP_LOGE(TAG, "inference failed");
+      self->failed_ = !ok;
+      if (!detected) continue;
+      // The window has started over; the model starts from silence too.
+      self->model_.reset();
+      const float mean = self->window_.mean();
+      self->last_peak_ = mean;
+      if (!self->armed_) continue;  // disarmed while this audio waited
+      ESP_LOGI(TAG, "detected p=%.2f", static_cast<double>(mean));
+      events::post(EventType::Wake);
     }
   }
-  d->reset();
-  static const int16_t kSilence[kChunk] = {};
-  const size_t samples = spec.clip ? spec.clip_samples : size_t(kSampleRate);
-  for (size_t off = 0; off < samples; off += kChunk) {
-    const size_t n = samples - off < kChunk ? samples - off : kChunk;
-    d->feed(spec.clip ? spec.clip + off : kSilence, n);
-  }
-  std::printf("wake-test %s on %s (%u ms): max p %.3f, max mean %.3f, cutoff %.2f, %s at %u ms; "
-              "%u invokes, %u us mean, %u us max\n",
-              spec.name, spec.clip ? "clip" : "silence", unsigned(samples * 1000 / kSampleRate), d->max_p_,
-              d->max_mean_, spec.cutoff, d->detect_invoke_ ? "DETECTED" : "not detected",
-              unsigned(d->detect_invoke_ * d->stride_ * 10), unsigned(d->invokes_),
-              unsigned(d->invokes_ ? d->invoke_us_total_ / d->invokes_ : 0), unsigned(d->invoke_us_max_));
-  vTaskDelete(nullptr);
-}
 
-int cmd_wake_test(int argc, char** argv) {
-  size_t m = 0;
-  if (argc > 1) {
-    for (m = 0; m < kModelCount && std::strcmp(kModels[m].name, argv[1]) != 0; ++m) {
+  // Feeds the built-in 16 kHz clip (or a second of silence) through the model and the
+  // detection rule, and prints what it saw. Live detection restarts afterwards.
+  void run_test() {
+#if CONFIG_HG_WAKE_WORD_TEST_CLIP
+    const int16_t* clip = reinterpret_cast<const int16_t*>(hg_wake_clip_start);
+    const size_t samples = size_t(hg_wake_clip_end - hg_wake_clip_start) / sizeof(int16_t);
+#else
+    const int16_t* clip = nullptr;
+    const size_t samples = kSampleRate;
+#endif
+    static const int16_t kSilence[kSampleRate / 100] = {};
+    model_.reset();
+    window_.reset();
+    float max_p = 0, max_mean = 0;
+    uint32_t inferences = 0, detected_at = 0;
+    bool ok = true;
+    for (size_t off = 0; off < samples && ok; off += kSampleRate / 100) {
+      const size_t n = samples - off < kSampleRate / 100 ? samples - off : kSampleRate / 100;
+      ok = model_.feed(clip ? clip + off : kSilence, n, [&](float p) {
+        ++inferences;
+        if (p > max_p) max_p = p;
+        const bool hit = window_.push(p);
+        if (window_.mean() > max_mean) max_mean = window_.mean();
+        if (hit && !detected_at) detected_at = inferences;
+      });
     }
+    std::printf("wake-test %s on %s (%u ms): max p %.3f, max mean %.3f, cutoff %.2f, %s at %u ms; "
+                "%u inferences; since boot %u us mean, %u us max%s\n",
+                CONFIG_HG_WAKE_WORD_MODEL, clip ? "clip" : "silence", unsigned(samples * 1000 / kSampleRate),
+                static_cast<double>(max_p), static_cast<double>(max_mean), CONFIG_HG_WAKE_WORD_CUTOFF_PCT / 100.0,
+                detected_at ? "DETECTED" : "not detected", unsigned(detected_at * model_.ms_per_inference()),
+                unsigned(inferences), unsigned(model_.invoke_us_mean_.load()), unsigned(model_.invoke_us_max_.load()),
+                ok ? "" : "; inference FAILED");
+    restart_ = true;
   }
-  if (m >= kModelCount) {
-    std::printf("@error wake-test: models built in:");
-    for (const ModelSpec& s : kModels) std::printf(" %s", s.name);
-    std::printf("\n");
+
+  Model model_;
+  hg::Resample3to2 resampler_;
+  hg::WakeWindow window_{1, 1, 0};
+  StreamBufferHandle_t audio_ = nullptr;
+  CodecMic* mic_ = nullptr;
+  std::atomic<bool> armed_{false}, restart_{false}, test_{false};
+  std::atomic<float> last_peak_{0};
+  bool failed_ = false;
+};
+
+Detector* Detector::instance = nullptr;
+
+int cmd_wake_test(int, char**) {
+  if (!Detector::instance) {
+    std::printf("@error wake-test: no wake word detector on this board (see the boot log)\n");
     return 0;
   }
-  // Its own task: the REPL task's stack is too small for the interpreter.
-  if (xTaskCreate(run_test, "wake_test", 8192, reinterpret_cast<void*>(m), 5, nullptr) != pdPASS)
-    std::printf("@error wake-test: no memory for the task\n");
+  Detector::instance->request_test();
+  std::printf("wake-test: queued; the result follows within a second\n");
   return 0;
 }
 
 }  // namespace
 
+hg::WakeWord* begin(CodecMic& mic) {
+  auto* d = new (std::nothrow) Detector();
+  Detector::instance = d;  // the mic sink and the task reach it from here
+  if (!d || !d->begin(mic)) {
+    ESP_LOGE(TAG, "wake word off: the detector did not start");
+    Detector::instance = nullptr;
+    return nullptr;  // ponytail: a failed begin() leaks its few allocations; it happens at most once, at boot
+  }
+  return d;
+}
+
+void report(hg::json::Value& r, const hg::WakeStats& stats) {
+  if (!Detector::instance) return;
+  hg::json::Value wake = hg::json::Value::object();
+  wake.set("armed", stats.armed).set("detections", static_cast<unsigned>(stats.detections))
+      .set("no_speech", static_cast<unsigned>(stats.no_speech));
+  Detector::instance->report(wake);
+  r.set("wake", wake);
+}
+
 void register_console() {
-  static_assert(kModelCount > 0, "CONFIG_HG_WAKE_WORD needs at least one model");
   esp_console_cmd_t cmd = {};
   cmd.command = "wake-test";
-  cmd.help = "Run a wake-word model on its built-in clip: wake-test [hermes|jarvis]";
+  cmd.help = "Run the wake word model on its built-in clip (or a second of silence) and print what it saw";
   cmd.func = &cmd_wake_test;
   esp_console_cmd_register(&cmd);
 }

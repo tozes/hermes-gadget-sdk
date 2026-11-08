@@ -48,36 +48,81 @@ menu "Hermes Gadget"
             board and in release images. docs/tailnet.md
 
     config HG_WAKE_WORD
-        bool "Wake-word detector (experimental spike)"
+        bool "Wake word (experimental)"
         default n
         depends on SPIRAM && IDF_TARGET_ESP32S3
         help
-            Builds in a microWakeWord detector: the TensorFlow Lite Micro
-            audio frontend (esp-micro-speech-features) and a streaming model
-            run by esp-tflite-micro, with its tensor arena in PSRAM. Spike
-            only: nothing feeds it the microphone yet. The console's
-            `wake-test [hermes|jarvis]` runs a model on a built-in clip
-            (HG_WAKE_WORD_TEST_CLIPS) or on one second of silence, and logs
-            the peak probability, the detection and the time per inference.
-            Off on every board and in release images.
+            Builds in a microWakeWord detector (port_wake.cpp): the
+            microphone at 24 kHz, resampled to 16 kHz, through the TensorFlow
+            Lite Micro audio frontend (esp-micro-speech-features) and one
+            streaming model run by esp-tflite-micro, with its tensor arena in
+            PSRAM. It listens only on a board with BoardConfig::wake_word,
+            with the `wake_word` setting on, and only while the core arms it
+            (USB power, idle). Off on every board and in release images.
+            docs/development.md#try-the-wake-word-experimental
 
-    config HG_WAKE_WORD_HEY_HERMES
-        bool "Embed the \"Hey Hermes\" model (62 KB)"
-        default y
+    # One model is built in. To add one: a choice entry, a default for each
+    # HG_WAKE_WORD_* value below from its manifest (micro.* in its JSON),
+    # wake/<HG_WAKE_WORD_MODEL>.tflite, and its source and licence in NOTICE
+    # and THIRD_PARTY_NOTICES.md.
+    choice HG_WAKE_WORD_MODEL_CHOICE
+        prompt "Wake word model"
+        default HG_WAKE_WORD_MODEL_HEY_JARVIS
         depends on HG_WAKE_WORD
 
-    config HG_WAKE_WORD_HEY_JARVIS
-        bool "Embed the \"Hey Jarvis\" model (51 KB)"
-        default y
-        depends on HG_WAKE_WORD
+        config HG_WAKE_WORD_MODEL_HEY_JARVIS
+            bool "Hey Jarvis (esphome/micro-wake-word-models, 51 KB)"
+        config HG_WAKE_WORD_MODEL_HEY_HERMES
+            bool "Hey Hermes (miketomkins/hey-hermes-wakeword-model, 61 KB)"
+    endchoice
 
-    config HG_WAKE_WORD_TEST_CLIPS
-        bool "Embed a 16 kHz test clip for each model (about 50 KB each)"
+    config HG_WAKE_WORD_MODEL
+        string
+        depends on HG_WAKE_WORD
+        default "hey_jarvis" if HG_WAKE_WORD_MODEL_HEY_JARVIS
+        default "hey_hermes" if HG_WAKE_WORD_MODEL_HEY_HERMES
+
+    config HG_WAKE_WORD_PHRASE
+        string
+        depends on HG_WAKE_WORD
+        default "Hey Jarvis" if HG_WAKE_WORD_MODEL_HEY_JARVIS
+        default "Hey Hermes" if HG_WAKE_WORD_MODEL_HEY_HERMES
+
+    config HG_WAKE_WORD_ARENA
+        int
+        depends on HG_WAKE_WORD
+        default 22860 if HG_WAKE_WORD_MODEL_HEY_JARVIS
+        default 65536 if HG_WAKE_WORD_MODEL_HEY_HERMES
+
+    config HG_WAKE_WORD_CUTOFF_PCT
+        int "Detection cutoff (percent)"
+        depends on HG_WAKE_WORD
+        range 1 99
+        default 97 if HG_WAKE_WORD_MODEL_HEY_JARVIS
+        default 32 if HG_WAKE_WORD_MODEL_HEY_HERMES
+        help
+            A wake is the mean of the model's last HG_WAKE_WORD_WINDOW
+            probabilities above this. The default is the model manifest's
+            probability_cutoff. Higher: fewer false wakes, more misses.
+
+    config HG_WAKE_WORD_WINDOW
+        int "Probabilities averaged (sliding window)"
+        depends on HG_WAKE_WORD
+        range 1 10
+        default 5
+        help
+            One probability per 30 ms of audio. The default is the model
+            manifest's sliding_window_size.
+
+    config HG_WAKE_WORD_TEST_CLIP
+        bool "Embed a 16 kHz test clip for `wake-test` (about 50 KB)"
         default n
         depends on HG_WAKE_WORD
         help
-            Synthetic speech (Kokoro TTS) for `wake-test`: "Hey Hermes" for
-            the Hey Hermes model, "Hey Jarvis" for the Hey Jarvis model.
+            wake/<HG_WAKE_WORD_MODEL>_test.pcm, synthetic speech (Kokoro
+            TTS) of the model's phrase. Without it `wake-test` runs one
+            second of silence. Too large to fit beside a model on the
+            AMOLED-1.75C's 10% free-space check.
 
     config HG_FRAME_STATS
         bool "Time every frame from boot"

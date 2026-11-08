@@ -433,6 +433,52 @@ A check of the TailTiny 3.1.0 update ([#283](https://github.com/Adolanium/hermes
 - **Idle on battery:** with the screen dark, 16 minutes on the update's image with a battery reading every 30 s (the longest step was 35 s) and no reconnect or reset. On the image with counters, 15 minutes all in doze, 12.7% of it in light sleep (114.7 s of 901.5 s, 6,629 wake-ups). An earlier image with TailTiny 3.0.2 and the patches this update drops spent 0 s in light sleep over 90 minutes on a phone hotspot. The networks differ, so this compares only roughly.
 - **Not run on this image:** a relay path, the refusal, Wi-Fi changes, OTA over the tailnet, turning it off, the two-hour battery comparison and the one-hour run.
 
+## Wake word
+
+The [on-device wake word](development.md#try-the-wake-word-experimental) is off on every board and in release images. It keeps the microphone and a model running whenever the device listens for it. It also adds about 157 KB of flash on the AMOLED-1.75C (measured build sizes: 1,630,384 bytes without it, 1,787,328 with Hey Jarvis and 1,797,360 with Hey Hermes). Only the AMOLED-1.75C has `wake_word` in its `BoardConfig`, and it uses it only in a build with the option. It has not been checked on hardware yet.
+
+To try it, build with this line appended to `firmware/esp32/boards/esp32s3-touch-amoled-175c/sdkconfig.defaults`, then flash over USB:
+
+```text
+# Wake word (docs/hardware-validation.md#wake-word).
+CONFIG_HG_WAKE_WORD=y
+```
+
+Delete the generated `firmware/esp32/sdkconfig.<board>` before building, or the configuration check stops the build. Add `CONFIG_HG_WAKE_WORD_MODEL_HEY_HERMES=y` for the other model. Then run `set wake_word on`, and check:
+
+1. **Boot:** the log shows `hg.wake: hey_jarvis: stride 3, arena N of 22860 B (PSRAM)` and `hg.wake: ready: "Hey Jarvis", cutoff 97%, window 5`. Record N.
+2. **Diag:** `diag` has `wake` with `armed`, `detections`, `no_speech`, `last_peak`, `invoke_us_mean`, `invoke_us_max` and `model`. `stacks` lists `hg-wake`; record its free bytes after the long run.
+3. **Arming:** on USB power, connected and idle, the log shows `hg.wake: armed` and the home screen's hint names the phrase. Unplugged on battery, it shows `hg.wake: disarmed` and the hint goes back to TALK. A turn, the menu, a reply playing or `set wake_word off` disarms it too.
+4. **`wake-test`:** on the serial console, it prints a line ending in the time per inference. Record `invoke_us_mean` and `invoke_us_max`. A mean near 30,000 µs means the model can't keep up.
+5. **Wakes at 1 m and 3 m:** say the phrase 10 times at each distance in a quiet room. Each wake beeps and starts a hands-free turn (`hg.wake: detected p=…`, then `wake word heard`). Count the wakes and misses at each distance.
+6. **Refractory:** saying the phrase twice within two seconds starts one turn.
+7. **False wakes:** 8 hours armed on USB beside normal speech, TV or music. Count `detections` and `no_speech` in `diag` and the wakes you didn't ask for.
+8. **Event queue:** the log never shows `event queue full`, while armed or during a turn.
+9. **Recording:** a tap recording right after a wake and one with TALK while armed each reach Hermes with 0 unsent frames (`recording: … 0 frames lost`, or the last recording's `frames_lost` in `diag`), and the reply plays.
+10. **Memory:** `internal_min_free` in `diag` after a long spoken reply, with the wake word on and off.
+
+Use this report format:
+
+```text
+Model / PCB revision:
+Firmware commit (with the line above), model, cutoff and window:
+Image size, wake word on and off:
+Boot lines, arena used:
+Arming on USB, disarming on battery and during a turn:
+wake-test: invoke mean / max (µs):
+Wakes / misses at 1 m (of 10):
+Wakes / misses at 3 m (of 10):
+Refractory:
+8-hour soak: false wakes, detections, no_speech:
+Event queue full seen:
+Tap and TALK recordings: unsent frames:
+internal_min_free after a long reply, on and off:
+hg-wake stack free:
+Failed or untested steps:
+```
+
+Attach the report to a pull request that adds the line above to the board's `sdkconfig.defaults` and the wake word to its row in the table above. Release images get the wake word only after such a report.
+
 ## Support labels
 
 - **Experimental:** the port builds and passes automated checks, but no complete physical report is linked for that configuration.

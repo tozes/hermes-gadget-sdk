@@ -148,16 +148,24 @@ The text the device shows by itself is listed once, with its English, in `firmwa
 
 A message a language leaves out shows in English, so a new message in `i18n.hpp` doesn't break the other languages; the completeness test says which are missing. Messages from Hermes are not in the catalogue.
 
-### Try the wake-word detector (experimental)
+### Try the wake word (experimental)
 
-`CONFIG_HG_WAKE_WORD` (off by default, ESP32-S3 with PSRAM only) builds in a microWakeWord detector: TensorFlow Lite Micro's audio frontend and a streaming model on `esp-tflite-micro`, with the tensor arena in PSRAM (`firmware/esp32/main/port_wake.cpp`). Nothing feeds it the microphone yet. To try it, add these lines to the board's `sdkconfig.defaults`, delete the generated `firmware/esp32/sdkconfig.<board>` and build:
+`CONFIG_HG_WAKE_WORD` (off by default, ESP32-S3 with PSRAM only) builds in an on-device wake word (`firmware/esp32/main/port_wake.cpp`). While the device listens for it, the codec microphone stays on and its 24 kHz audio goes to a detector task instead of to Hermes. The task resamples it to 16 kHz, runs TensorFlow Lite Micro's audio frontend and one streaming microWakeWord model on `esp-tflite-micro`, with the tensor arena in PSRAM, and starts a hands-free turn on a detection. Only a board with `wake_word` in its `BoardConfig` uses it. Today that is the AMOLED-1.75C, and it stays experimental until it passes the [wake word checks](hardware-validation.md#wake-word). To build it, add this line to the board's `sdkconfig.defaults`, delete the generated `firmware/esp32/sdkconfig.<board>` and build:
 
 ```
 CONFIG_HG_WAKE_WORD=y
-CONFIG_HG_WAKE_WORD_TEST_CLIPS=y
 ```
 
-On the serial console, `wake-test hermes` or `wake-test jarvis` runs that model on its built-in synthetic clip (one second of silence without the clips) and prints the peak probability, whether the mean of the model's last five probabilities crossed its cutoff, and the time per inference. `CONFIG_HG_WAKE_WORD_HEY_HERMES` and `CONFIG_HG_WAKE_WORD_HEY_JARVIS` choose the models built in. On the AMOLED-1.75C only one model fits the 10% free-space check, so turn the other off; both models, or the test clips, push the image past it. To save space, TensorFlow Lite Micro is built with `-Oz` instead of its own `-O3`, and with `TF_LITE_STRIP_ERROR_STRINGS`, so it prints no error text. The models and their sources are listed in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+Then `set wake_word on` on the device. It listens only on USB power, connected to Hermes and idle; the home screen's hint then names the phrase. Battery power, a turn, the menu or a reply playing turns the microphone back off.
+
+| Option | Default | What it sets |
+|---|---|---|
+| `CONFIG_HG_WAKE_WORD_MODEL_HEY_JARVIS` / `_HEY_HERMES` | Hey Jarvis | The one model built in, its phrase and its tensor arena (22,860 or 65,536 bytes) |
+| `CONFIG_HG_WAKE_WORD_CUTOFF_PCT` | 97 (Jarvis), 32 (Hermes) | A wake is the mean of the last probabilities above this percentage. Higher means fewer false wakes and more misses. |
+| `CONFIG_HG_WAKE_WORD_WINDOW` | 5 | How many probabilities, one per 30 ms of audio, the mean covers |
+| `CONFIG_HG_WAKE_WORD_TEST_CLIP` | off | Embeds a 16 kHz synthetic clip of the phrase for `wake-test` |
+
+The defaults are the values in each model's manifest. After a wake, the detector ignores the next 2 seconds. On the serial console, `wake-test` runs the model on its built-in clip, or on one second of silence without it. It prints the peak probability, whether the mean crossed the cutoff and the time per inference. The test clip does not fit beside a model on the AMOLED-1.75C under the 10% free-space check. To save space, TensorFlow Lite Micro is built with `-Oz` instead of its own `-O3`, and with `TF_LITE_STRIP_ERROR_STRINGS`, so it prints no error text. Adding a model takes a choice entry and its values in `firmware/esp32/main/Kconfig.projbuild`, its file in `firmware/esp32/main/wake/`, and its source and licence in `NOTICE` and [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 
 ### Build checks
 

@@ -74,7 +74,11 @@ namespace hgp {
 // Events
 
 enum class EventType : uint8_t { NetUp, NetDown, WsOpen, WsText, WsBinary, WsClosed, Mic, Console, Touch, Key,
-                                 WifiStarted, WifiDisconnected, WifiProvision, WifiScanDone, Encoder, Phone, TimeSynced };
+                                 WifiStarted, WifiDisconnected, WifiProvision, WifiScanDone, Encoder, Phone, TimeSynced,
+#if CONFIG_HG_WAKE_WORD
+                                 Wake,  // the wake word detector heard its phrase (port_wake.cpp)
+#endif
+};
 
 // Payload of Phone events (posted by the Bluetooth host task).
 struct PhoneSample {
@@ -508,6 +512,14 @@ class CodecMic final : public hg::AudioIn {
   bool begin(esp_codec_dev_handle_t dev, bool rmnm, const CodecAudio::MicLink& link);
   bool start(uint32_t sample_rate) override;
   void stop() override { capturing_ = false; }
+#if CONFIG_HG_WAKE_WORD
+  // The wake word detector's always-on capture (port_wake.cpp): while listening and not
+  // recording, the ADC stays on and every chunk (24 kHz) goes to `sink` on the mic task
+  // instead of to the app. A recording takes over until it stops (hg::MicPower).
+  using Sink = void (*)(const int16_t* pcm, size_t samples);
+  void set_sink(Sink sink) { sink_ = sink; }
+  void set_listening(bool on);
+#endif
 
  private:
   static void task(void* arg);
@@ -517,6 +529,10 @@ class CodecMic final : public hg::AudioIn {
   bool rmnm_ = false;
   int16_t* raw_ = nullptr;
   std::atomic<bool> capturing_{false};
+#if CONFIG_HG_WAKE_WORD
+  Sink sink_ = nullptr;
+  std::atomic<bool> listening_{false};
+#endif
 };
 
 class CodecSpeaker final : public hg::AudioOut {
@@ -884,8 +900,16 @@ void begin();
 }
 
 #if CONFIG_HG_WAKE_WORD
+// The wake word detector (port_wake.cpp, CONFIG_HG_WAKE_WORD_MODEL): while armed, the codec
+// microphone's chunks go through a 24 to 16 kHz resampler to the model on the detector's
+// own task, and a detection posts one EventType::Wake.
 namespace wake {
-// Registers the console's `wake-test [hermes|jarvis]` (port_wake.cpp).
+// Loads the model and starts the detector on `mic`; null when it can't (logged). Call once.
+hg::WakeWord* begin(CodecMic& mic);
+// The `wake` object of `diag`: the core's `stats` and the detector's numbers. Nothing
+// without a running detector.
+void report(hg::json::Value& r, const hg::WakeStats& stats);
+// Registers the console's `wake-test`.
 void register_console();
 }
 #endif

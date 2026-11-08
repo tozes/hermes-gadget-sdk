@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "battery_curve.hpp"
+#include "sdkconfig.h"  // CONFIG_HG_WAKE_WORD decides BoardConfig's layout
 
 namespace hgp {
 
@@ -345,6 +346,13 @@ struct BoardConfig {
   // boards only) and stays off until the board passes the checks in
   // docs/hardware-validation.md#tailnet.
   bool tailnet = false;
+#if CONFIG_HG_WAKE_WORD
+  // An on-device wake word on the codec microphone (port_wake.cpp). Experimental: needs
+  // the wake word lines in the board's sdkconfig.defaults and stays off until the board
+  // passes the checks in docs/hardware-validation.md#wake-word. Only in builds with the
+  // option, so builds without it keep their exact layout.
+  bool wake_word = false;
+#endif
   LatchPowerConfig latch_power;
   int status_led = -1;
   // A speaker driven by the chip's own DAC, with no I2S and no codec: the pin the
