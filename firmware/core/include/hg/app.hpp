@@ -439,7 +439,8 @@ class App {
   // too (arming); without, a wake's own beep may still play.
   bool wake_supported() const { return hal_.wake && profile_.wake_phrase && hal_.speaker; }
   bool wake_ready(bool speaker) const;
-  // Arms or disarms the detector, telling the port only of a change.
+  // Arms or disarms the detector, telling the port only of a change. wake_tick() arms;
+  // update_model() disarms one the new state no longer allows, before the next tick.
   void set_wake_armed(bool armed);
   void wake_tick();
   // A pending wake (on_wake → its beep → wake_tick starts the recording) ends without recording.

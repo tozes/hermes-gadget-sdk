@@ -9233,32 +9233,44 @@ TEST("wake: a wake while not armed is ignored") {
   CHECK_EQ(r.app.wake_stats().detections, uint32_t(0));
 }
 
-TEST("wake: a detection from before an off and on again starts nothing; one from the new arming does") {
+// A change that stops the wake word, undone before the next tick: the detector's late result
+// from before it starts nothing, and a fresh arming still works.
+static void check_stale_wake_after(void (*off_and_on)(hg::App&)) {
   WakeRig r;
   r.arm();
   CHECK(r.wake.armed());
   const uint32_t before = r.wake.session();  // the detector is busy with this session's audio
-  CHECK_EQ(r.app.console("set wake_word off"), std::string("@ok wake_word"));
-  r.advance(200);
-  CHECK(!r.wake.armed());
-  CHECK_EQ(r.app.console("set wake_word on"), std::string("@ok wake_word"));
-  r.advance(200);
-  CHECK(r.wake.armed());
+  off_and_on(r.app);  // no tick in between
   CHECK(r.wake.session() != before);
   const size_t samples = r.fake.spk_samples;
   r.app.on_wake(before);  // its late result
+  CHECK_EQ(r.fake.spk_samples, samples);  // no beep
   r.advance(500);
   CHECK(r.fake.last("audio.start") == nullptr);
   CHECK(!r.fake.mic_on);
-  CHECK_EQ(r.fake.spk_samples, samples);  // no beep
+  CHECK_EQ(r.fake.spk_samples, samples);
   CHECK_EQ(r.app.wake_stats().detections, uint32_t(0));
-  CHECK(r.wake.armed());  // still listening for a fresh one
+  CHECK(r.wake.armed());  // armed again, listening for a fresh one
 
   r.app.on_wake(r.wake.session());
   r.advance(10);
   CHECK(r.fake.mic_on);
   CHECK(r.fake.last("audio.start") != nullptr);
   CHECK_EQ(r.app.wake_stats().detections, uint32_t(1));
+}
+
+TEST("wake: a detection from before an off and on again starts nothing; one from the new arming does") {
+  check_stale_wake_after([](hg::App& app) {
+    CHECK_EQ(app.console("set wake_word off"), std::string("@ok wake_word"));
+    CHECK_EQ(app.console("set wake_word on"), std::string("@ok wake_word"));
+  });
+}
+
+TEST("wake: a detection from before settings opened and closed starts nothing; one from the new arming does") {
+  check_stale_wake_after([](hg::App& app) {
+    CHECK(app.open_settings());
+    app.close_settings();
+  });
 }
 
 TEST("wake: it beeps, records only once the beep has played, and the turn ends like tap-to-talk") {

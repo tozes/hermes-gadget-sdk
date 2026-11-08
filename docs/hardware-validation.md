@@ -435,7 +435,7 @@ A check of the TailTiny 3.1.0 update ([#283](https://github.com/Adolanium/hermes
 
 ## Wake word
 
-The [on-device wake word](development.md#try-the-wake-word-experimental) is built into the AMOLED-1.75C by its `sdkconfig.defaults`, with Hey Jarvis at a 52% cutoff and a window of 8 instead of the manifest's 97% and 5. Every other board leaves it out. The `wake_word` setting still starts off. It keeps the microphone and a model running whenever the device listens for it. It also adds about 157 KB of flash on the AMOLED-1.75C (measured build sizes: 1,630,608 bytes without it, 1,788,272 with Hey Jarvis and 1,797,360 with Hey Hermes in an earlier build). Only the AMOLED-1.75C has `wake_word` in its `BoardConfig`. It has not been checked on hardware yet.
+The [on-device wake word](development.md#try-the-wake-word-experimental) is built into the AMOLED-1.75C by its `sdkconfig.defaults`, with Hey Jarvis at a 52% cutoff and a window of 8 instead of the manifest's 97% and 5. Every other board leaves it out. The `wake_word` setting still starts off. It keeps the microphone and a model running whenever the device listens for it. It also adds about 157 KB of flash on the AMOLED-1.75C (measured build sizes: 1,630,608 bytes without it, 1,788,288 with Hey Jarvis and 1,797,360 with Hey Hermes in an earlier build). Only the AMOLED-1.75C has `wake_word` in its `BoardConfig`. It has not been checked on hardware yet.
 
 The board's defaults carry these lines:
 

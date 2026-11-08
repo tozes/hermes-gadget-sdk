@@ -69,6 +69,25 @@ TEST("wake feed: a full ring drops whole chunks, counts them, and the next one r
   CHECK(!t.restart);
 }
 
+TEST("wake feed: the chunk the detector is still working on stays its own until take() returns") {
+  Rig r(4);
+  r.feed.set_session(1);
+  CHECK(r.push(1));
+  bool held = false;
+  CHECK(r.feed.take([&](const int16_t* pcm, size_t n, uint32_t session, bool) {
+    held = true;
+    // The mic keeps pushing while the detector holds the chunk: only the other slots take audio.
+    CHECK(r.push(2));
+    CHECK(r.push(3));
+    CHECK(!r.push(4));  // full: the held slot isn't the producer's yet
+    CHECK_EQ(r.feed.dropped(), uint32_t(1));
+    for (size_t i = 0; i < n; ++i) CHECK_EQ(pcm[i], int16_t(1));
+    r.feed.set_session(3);  // re-armed while the detector works on the chunk
+    CHECK(!r.feed.current(session));  // its detection isn't published
+  }));
+  CHECK(held);
+}
+
 TEST("wake feed: the ring keeps working across the wrap") {
   Rig r(3);
   r.feed.set_session(1);

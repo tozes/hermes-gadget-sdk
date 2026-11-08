@@ -2476,8 +2476,11 @@ void App::tick() {
 }
 
 void App::update_model() {
-  // Every change of state ends here: a pending wake it no longer allows ends with it.
+  // Every change of state ends here: a pending wake it no longer allows ends with it, and an
+  // armed detector disarms at once, so a detection heard before a change undone before the next
+  // tick doesn't start a turn. Arming again waits for wake_tick().
   if (wake_pending_ && !wake_ready(false)) drop_pending_wake("taken over");
+  if (wake_armed_ && !wake_ready(true)) set_wake_armed(false);
   UiModel& m = model_;
   // A recording held through a lost connection keeps its screen over the connecting ones.
   const bool held = recording_held() && (mode_ == Mode::Listening || mode_ == Mode::Thinking);
