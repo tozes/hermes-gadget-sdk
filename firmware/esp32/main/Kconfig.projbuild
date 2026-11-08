@@ -58,7 +58,8 @@ menu "Hermes Gadget"
             streaming model run by esp-tflite-micro, with its tensor arena in
             PSRAM. It listens only on a board with BoardConfig::wake_word,
             with the `wake_word` setting on, and only while the core arms it
-            (USB power, idle). Off on every board and in release images.
+            (USB power, idle). Off by default; the AMOLED-1.75C's
+            sdkconfig.defaults turns it on.
             docs/development.md#try-the-wake-word-experimental
 
     # One model is built in. To add one: a choice entry, a default for each

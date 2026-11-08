@@ -9033,7 +9033,12 @@ namespace {
 // The port's detector: what the core last told it, and every call.
 struct FakeWake : hg::WakeWord {
   std::vector<bool> calls;
-  void set_armed(bool armed) override { calls.push_back(armed); }
+  const bool* mic_on = nullptr;       // the board's microphone
+  bool mic_was_on_at_disarm = false;  // a recording started before the detector let go
+  void set_armed(bool armed) override {
+    calls.push_back(armed);
+    if (!armed && mic_on && *mic_on) mic_was_on_at_disarm = true;
+  }
   bool armed() const { return !calls.empty() && calls.back(); }
 };
 
@@ -9056,6 +9061,7 @@ struct WakeRig : Rig {
   explicit WakeRig(hg::DeviceProfile p = wake_profile()) : Rig(std::move(p)) {
     hal.wake = &wake;
     hal.power = &power;
+    wake.mic_on = &fake.mic_on;
   }
   static hg::DeviceProfile wake_profile() {
     hg::DeviceProfile p = profile("ws://hermes.local:8765/gadget");
@@ -9275,6 +9281,7 @@ TEST("wake: it beeps, records only once the beep has played, and the turn ends l
   CHECK(!r.app.in_turn());
   CHECK(r.wake.armed());  // re-armed once the reply has finished
   CHECK_EQ(r.app.wake_stats().no_speech, uint32_t(0));
+  CHECK(!r.wake.mic_was_on_at_disarm);  // the microphone started only after each disarm
 }
 
 TEST("wake: a speaker that never reports the beep finished delays the recording 1.5 s at most") {
@@ -9324,6 +9331,7 @@ TEST("wake: TALK still talks while armed, and a press during the beep takes over
   r.app.on_button(hg::Button::Talk, true);
   CHECK(!r.wake.armed());  // let go of the microphone before recording
   CHECK(r.fake.mic_on);
+  CHECK(!r.wake.mic_was_on_at_disarm);  // disarmed first, then the microphone started
   const Value* start = r.fake.last("audio.start");
   CHECK(start && (*start)["mode"].as_string() == "hold");
   r.feed(1000, 5);
@@ -9345,6 +9353,7 @@ TEST("wake: TALK still talks while armed, and a press during the beep takes over
   start = r.fake.last("audio.start");
   CHECK(start && (*start)["mode"].as_string() == "hold");  // the wake's recording never starts
   CHECK(r.app.screen() == hg::Screen::Listening);
+  CHECK(!r.wake.mic_was_on_at_disarm);
 }
 
 TEST("wake: CANCEL during the beep, pressed or from the console, stops it and drops the wake") {

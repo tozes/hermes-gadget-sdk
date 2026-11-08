@@ -28,7 +28,8 @@ endif()
 # Wake word: the components are fetched for every ESP32-S3 (idf_component.yml) and
 # required unconditionally there, because requirements are resolved before the
 # sdkconfig exists. port_wake.cpp compiles to nothing without CONFIG_HG_WAKE_WORD,
-# so nothing links them in.
+# so nothing links them in, and their flag overrides at the end of this file apply
+# only with the option.
 set(HG_WAKE_REQUIRES)
 if(IDF_TARGET STREQUAL "esp32s3")
     list(APPEND HG_WAKE_REQUIRES esp-tflite-micro esp-micro-speech-features)
@@ -108,12 +109,15 @@ idf_component_register(
 # port_wake.cpp .incbin's the models from here (EMBED_FILES can't follow the
 # sdkconfig under PlatformIO, which needs every embedded file in platformio.ini).
 target_compile_definitions(${COMPONENT_LIB} PRIVATE "HG_WAKE_DIR=\"${CMAKE_CURRENT_LIST_DIR}/wake\"")
-if(HG_WAKE_REQUIRES)
+if(CONFIG_HG_WAKE_WORD)
     # TFLM without its error and log text (MicroPrintf becomes a no-op): it has to
     # fit the app slot's 10% margin beside one model. port_wake.cpp logs failures
-    # by return code instead.
+    # by return code instead. The define changes TFLM's headers (micro_log.h,
+    # micro_profiler.h), so the one file here that includes them gets it too;
+    # no other consumer does. Without the option TFLM keeps its own flags.
     idf_component_get_property(hg_tflm_lib espressif__esp-tflite-micro COMPONENT_LIB)
-    target_compile_definitions(${hg_tflm_lib} PUBLIC TF_LITE_STRIP_ERROR_STRINGS)
+    target_compile_definitions(${hg_tflm_lib} PRIVATE TF_LITE_STRIP_ERROR_STRINGS)
+    set_property(SOURCE port_wake.cpp APPEND PROPERTY COMPILE_DEFINITIONS TF_LITE_STRIP_ERROR_STRINGS)
     # The component builds with -O3; the last -O wins. Not -Os: CMake and
     # PlatformIO drop it as a duplicate of the project-wide -Os before -O3.
     target_compile_options(${hg_tflm_lib} PRIVATE -Oz)

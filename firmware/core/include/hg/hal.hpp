@@ -198,6 +198,9 @@ class Power {
 // An on-device wake word detector (DeviceProfile::wake_phrase names its phrase). The core
 // arms it only while a wake may start a turn (App::on_wake), and calls set_armed only when
 // that changes. While armed the port listens and calls App::on_wake when it hears the phrase.
+// The core disarms it before it starts a recording (AudioIn::start right after
+// set_armed(false)), so set_armed(false) must not return while the detector still holds
+// the microphone in a way that would keep the recording from getting every chunk.
 class WakeWord {
  public:
   virtual ~WakeWord() = default;

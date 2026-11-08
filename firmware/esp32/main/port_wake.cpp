@@ -71,7 +71,16 @@ using Resolver = tflite::MicroMutableOpResolver<13>;
 // TFLM's frontend and the streaming model, from 16 kHz samples to probabilities.
 class Model {
  public:
+  // Whatever begin() got, including after it failed part way. Free(nullptr) is a no-op
+  // throughout, and the frontend starts zeroed.
+  ~Model() {
+    delete interp_;  // before the arena it lives in
+    heap_caps_free(arena_);
+    FrontendFreeStateContents(&frontend_);
+  }
+
   // Allocates everything once: the arena in PSRAM, the interpreter and the frontend.
+  // On false the caller deletes the model; reset() and feed() are for a model that began.
   bool begin() {
     FrontendConfig fc;
     FrontendFillConfigWithDefaults(&fc);
@@ -109,12 +118,12 @@ class Model {
     resolver_.AddStridedSlice();
 
     constexpr size_t arena = CONFIG_HG_WAKE_WORD_ARENA;
-    uint8_t* mem = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!mem) {
+    arena_ = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, arena, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!arena_) {
       ESP_LOGE(TAG, "no PSRAM for a %u B arena", unsigned(arena));
       return false;
     }
-    tflite::MicroAllocator* alloc = tflite::MicroAllocator::Create(mem, arena);
+    tflite::MicroAllocator* alloc = tflite::MicroAllocator::Create(arena_, arena);
     tflite::MicroResourceVariables* vars = tflite::MicroResourceVariables::Create(alloc, 20);
     interp_ = new (std::nothrow) tflite::MicroInterpreter(tflite::GetModel(hg_wake_model_start), resolver_, alloc, vars);
     if (!interp_ || interp_->AllocateTensors() != kTfLiteOk) {
@@ -183,6 +192,7 @@ class Model {
  private:
   FrontendState frontend_{};
   Resolver resolver_;
+  uint8_t* arena_ = nullptr;  // holds the allocator and resource variables too
   tflite::MicroInterpreter* interp_ = nullptr;
   float in_scale_ = 1, out_scale_ = 1;
   int in_zero_ = 0, out_zero_ = 0;
@@ -194,17 +204,23 @@ class Model {
 // The port's hg::WakeWord: arming switches the mic task's capture and restarts the detector.
 class Detector final : public hg::WakeWord {
  public:
+  // Only for a detector whose begin() failed: one that began has a task using it for good.
+  ~Detector() override { heap_caps_free(storage_); }
+
+  // Everything that can fail comes before the task starts; after that the detector is
+  // published (instance, the mic's sink) and never freed. On false the caller deletes it.
   bool begin(CodecMic& mic) {
     if (!model_.begin()) return false;
     window_ = hg::WakeWindow(CONFIG_HG_WAKE_WORD_CUTOFF_PCT / 100.0f, CONFIG_HG_WAKE_WORD_WINDOW,
                              kRefractoryMs / model_.ms_per_inference());
-    uint8_t* storage = static_cast<uint8_t*>(heap_caps_malloc(kAudioBuffer + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    storage_ = static_cast<uint8_t*>(heap_caps_malloc(kAudioBuffer + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     static StaticStreamBuffer_t control;
-    audio_ = storage ? xStreamBufferCreateStatic(kAudioBuffer, 1, storage, &control) : nullptr;
+    audio_ = storage_ ? xStreamBufferCreateStatic(kAudioBuffer, 1, storage_, &control) : nullptr;
     if (!audio_ || xTaskCreate(&Detector::task, "hg-wake", kTaskStack, this, 3, nullptr) != pdPASS) {
       ESP_LOGE(TAG, "no memory for the detector's audio buffer or task");
       return false;
     }
+    instance = this;  // before the sink, which reaches it from here
     mic_ = &mic;
     mic.set_sink(&Detector::sink);
     ESP_LOGI(TAG, "ready: \"%s\", cutoff %d%%, window %d", CONFIG_HG_WAKE_WORD_PHRASE, CONFIG_HG_WAKE_WORD_CUTOFF_PCT,
@@ -212,6 +228,12 @@ class Detector final : public hg::WakeWord {
     return true;
   }
 
+  // The detector never reads the ES7210 itself: the mic task is its only reader and hands
+  // the detector chunks only while listening and not capturing (hg::MicPower::turn). So
+  // disarming just clears listening, and the AudioIn::start() the core calls next takes
+  // every chunk from then on even if the mic task hasn't seen this yet. Audio already queued
+  // here is dropped on re-arm; a detection from it posts nothing once disarmed, and the
+  // core ignores one posted just before (App::on_wake checks that it is armed).
   void set_armed(bool armed) override {
     if (armed) restart_ = true;  // before the first chunk arrives
     armed_ = armed;
@@ -226,8 +248,12 @@ class Detector final : public hg::WakeWord {
         .set("model", CONFIG_HG_WAKE_WORD_MODEL);
   }
 
-  // `wake-test`: runs on the detector's task, between chunks.
-  void request_test() { test_ = true; }
+  // `wake-test`: runs on the detector's task, between chunks, so never alongside live
+  // detection on the same model. False while one is queued or running (until it has printed).
+  bool request_test() {
+    bool idle = false;
+    return test_.compare_exchange_strong(idle, true);
+  }
 
   static Detector* instance;
 
@@ -244,7 +270,10 @@ class Detector final : public hg::WakeWord {
     for (;;) {
       // A second without audio (disarmed) still comes round for `wake-test`.
       const size_t got = xStreamBufferReceive(self->audio_, in, sizeof(in), pdMS_TO_TICKS(1000));
-      if (self->test_.exchange(false)) self->run_test();
+      if (self->test_.load()) {
+        self->run_test();
+        self->test_ = false;  // printed: the next wake-test may queue
+      }
       if (self->restart_.exchange(false)) {
         // (Re)armed, or after a test: start from silence, not from audio left over.
         xStreamBufferReset(self->audio_);
@@ -311,6 +340,7 @@ class Detector final : public hg::WakeWord {
   Model model_;
   hg::Resample3to2 resampler_;
   hg::WakeWindow window_{1, 1, 0};
+  uint8_t* storage_ = nullptr;  // audio_'s, in PSRAM
   StreamBufferHandle_t audio_ = nullptr;
   CodecMic* mic_ = nullptr;
   std::atomic<bool> armed_{false}, restart_{false}, test_{false};
@@ -325,7 +355,10 @@ int cmd_wake_test(int, char**) {
     std::printf("@error wake-test: no wake word detector on this board (see the boot log)\n");
     return 0;
   }
-  Detector::instance->request_test();
+  if (!Detector::instance->request_test()) {
+    std::printf("@error wake-test: busy, the last one has not printed yet\n");
+    return 0;
+  }
   std::printf("wake-test: queued; the result follows within a second\n");
   return 0;
 }
@@ -334,11 +367,10 @@ int cmd_wake_test(int, char**) {
 
 hg::WakeWord* begin(CodecMic& mic) {
   auto* d = new (std::nothrow) Detector();
-  Detector::instance = d;  // the mic sink and the task reach it from here
   if (!d || !d->begin(mic)) {
     ESP_LOGE(TAG, "wake word off: the detector did not start");
-    Detector::instance = nullptr;
-    return nullptr;  // ponytail: a failed begin() leaks its few allocations; it happens at most once, at boot
+    delete d;  // frees what begin() got; nothing was published
+    return nullptr;
   }
   return d;
 }

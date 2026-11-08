@@ -435,18 +435,20 @@ A check of the TailTiny 3.1.0 update ([#283](https://github.com/Adolanium/hermes
 
 ## Wake word
 
-The [on-device wake word](development.md#try-the-wake-word-experimental) is off on every board and in release images. It keeps the microphone and a model running whenever the device listens for it. It also adds about 157 KB of flash on the AMOLED-1.75C (measured build sizes: 1,630,384 bytes without it, 1,787,328 with Hey Jarvis and 1,797,360 with Hey Hermes). Only the AMOLED-1.75C has `wake_word` in its `BoardConfig`, and it uses it only in a build with the option. It has not been checked on hardware yet.
+The [on-device wake word](development.md#try-the-wake-word-experimental) is built into the AMOLED-1.75C by its `sdkconfig.defaults`, with Hey Jarvis at a 52% cutoff and a window of 8 instead of the manifest's 97% and 5. Every other board leaves it out. The `wake_word` setting still starts off. It keeps the microphone and a model running whenever the device listens for it. It also adds about 157 KB of flash on the AMOLED-1.75C (measured build sizes: 1,630,608 bytes without it, 1,788,016 with Hey Jarvis and 1,797,360 with Hey Hermes in an earlier build). Only the AMOLED-1.75C has `wake_word` in its `BoardConfig`. It has not been checked on hardware yet.
 
-To try it, build with this line appended to `firmware/esp32/boards/esp32s3-touch-amoled-175c/sdkconfig.defaults`, then flash over USB:
+The board's defaults carry these lines:
 
 ```text
-# Wake word (docs/hardware-validation.md#wake-word).
 CONFIG_HG_WAKE_WORD=y
+CONFIG_HG_WAKE_WORD_MODEL_HEY_JARVIS=y
+CONFIG_HG_WAKE_WORD_CUTOFF_PCT=52
+CONFIG_HG_WAKE_WORD_WINDOW=8
 ```
 
-Delete the generated `firmware/esp32/sdkconfig.<board>` before building, or the configuration check stops the build. Add `CONFIG_HG_WAKE_WORD_MODEL_HEY_HERMES=y` for the other model. Then run `set wake_word on`, and check:
+After changing them, delete the generated `firmware/esp32/sdkconfig.<board>` before building, or the configuration check stops the build. Replace the model line with `CONFIG_HG_WAKE_WORD_MODEL_HEY_HERMES=y` for the other model. Flash over USB, run `set wake_word on`, and check:
 
-1. **Boot:** the log shows `hg.wake: hey_jarvis: stride 3, arena N of 22860 B (PSRAM)` and `hg.wake: ready: "Hey Jarvis", cutoff 97%, window 5`. Record N.
+1. **Boot:** the log shows `hg.wake: hey_jarvis: stride 3, arena N of 22860 B (PSRAM)` and `hg.wake: ready: "Hey Jarvis", cutoff 52%, window 8`. Record N.
 2. **Diag:** `diag` has `wake` with `armed`, `detections`, `no_speech`, `last_peak`, `invoke_us_mean`, `invoke_us_max` and `model`. `stacks` lists `hg-wake`; record its free bytes after the long run.
 3. **Arming:** on USB power, connected and idle, the log shows `hg.wake: armed` and the home screen's hint names the phrase. Unplugged on battery, it shows `hg.wake: disarmed` and the hint goes back to TALK. A turn, the menu, a reply playing or `set wake_word off` disarms it too.
 4. **`wake-test`:** on the serial console, it prints a line ending in the time per inference. Record `invoke_us_mean` and `invoke_us_max`. A mean near 30,000 µs means the model can't keep up.
@@ -477,7 +479,7 @@ hg-wake stack free:
 Failed or untested steps:
 ```
 
-Attach the report to a pull request that adds the line above to the board's `sdkconfig.defaults` and the wake word to its row in the table above. Release images get the wake word only after such a report.
+Attach the report to the pull request that brings these defaults to `main`, and add the wake word to the board's row in the table above. Release images from `main` get the wake word only after such a report.
 
 ## Support labels
 

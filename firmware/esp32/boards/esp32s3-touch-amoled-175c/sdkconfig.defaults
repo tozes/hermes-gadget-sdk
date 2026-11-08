@@ -34,3 +34,11 @@ CONFIG_LWIP_TCP_WND_DEFAULT=32768
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# On-device wake word, experimental (docs/hardware-validation.md#wake-word). Hey
+# Jarvis, more sensitive than its manifest (97%, window 5): a wake is the mean of
+# the last 8 probabilities above 52%. The `wake_word` setting still starts off.
+CONFIG_HG_WAKE_WORD=y
+CONFIG_HG_WAKE_WORD_MODEL_HEY_JARVIS=y
+CONFIG_HG_WAKE_WORD_CUTOFF_PCT=52
+CONFIG_HG_WAKE_WORD_WINDOW=8
