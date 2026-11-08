@@ -150,14 +150,19 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
   bool spk_open = false;
   bool spk_draining = false;  // ended, but the last audio is still playing
   size_t spk_samples = 0;
-  bool begin(uint32_t) override { return spk_open = true; }
+  bool spk_refuse = false;  // begin() fails, as a speaker that can't start
+  int spk_aborts = 0;
+  bool begin(uint32_t) override { return spk_open = !spk_refuse; }
   bool spoke_while_dozing = false;  // the speaker was written before the port woke
   void write(const int16_t*, size_t n) override {
     spk_samples += n;
     if (dozing) spoke_while_dozing = true;
   }
   void end() override { spk_open = false; }
-  void abort() override { spk_open = false; }
+  void abort() override {
+    spk_open = false;
+    ++spk_aborts;
+  }
   bool busy() const override { return spk_open || spk_draining; }
   void set_volume(uint8_t percent) override { volume = percent; }
   size_t speaker_buffer = 0;  // what buffer_bytes() reports; 0: unknown, as a port without one says
@@ -9085,7 +9090,7 @@ TEST("wake: off by default; on, armed only on USB, online, paired and idle, tell
   r.advance(500);
   CHECK(r.wake.calls.empty());
   CHECK(!r.app.wake_stats().armed);
-  CHECK_EQ(r.app.console("get wake_word"), std::string(R"(@value {"key":"wake_word","value":""})"));
+  CHECK_EQ(r.app.console("get wake_word"), std::string(R"(@value {"key":"wake_word","value":"off"})"));
   CHECK(!r.indicator());
 
   CHECK_EQ(r.app.console("set wake_word on"), std::string("@ok wake_word"));
@@ -9342,6 +9347,111 @@ TEST("wake: TALK still talks while armed, and a press during the beep takes over
   CHECK(r.app.screen() == hg::Screen::Listening);
 }
 
+TEST("wake: CANCEL during the beep, pressed or from the console, stops it and drops the wake") {
+  for (const bool console : {false, true}) {
+    WakeRig r;
+    r.arm();
+    r.app.on_wake();
+    r.fake.spk_draining = true;  // the beep is playing
+    const int aborts = r.fake.spk_aborts;
+    if (console) {
+      CHECK_EQ(r.app.console("cancel"), std::string("@ok cancel"));
+    } else {
+      r.app.on_button(hg::Button::Cancel, true);  // held: acts at once
+    }
+    CHECK_EQ(r.fake.spk_aborts, aborts + 1);  // the beep stops
+    r.fake.spk_draining = false;
+    r.advance(2000);
+    if (!console) r.app.on_button(hg::Button::Cancel, false);
+    r.advance(100);
+    CHECK(!r.fake.mic_on);
+    CHECK(r.fake.last("audio.start") == nullptr);
+    CHECK(r.wake.armed());  // listening for a fresh wake
+  }
+}
+
+TEST("wake: anything that disarms it during the beep drops the wake, even if undone before the next tick") {
+  // Each event batch runs between two ticks, as the port's loop drains its queue before tick().
+  const std::vector<void (*)(WakeRig&)> batches = {
+      [](WakeRig& r) {
+        r.app.console("set wake_word off");
+        r.app.console("set wake_word on");
+      },
+      [](WakeRig& r) {
+        CHECK(r.app.open_settings());
+        r.app.close_settings();
+      },
+      [](WakeRig& r) {
+        r.server(R"({"type":"prompt","id":"q","title":"Allow?","text":"Continue?"})");
+        r.server(R"({"type":"prompt.close","id":"q"})");
+      },
+      [](WakeRig& r) {
+        r.server(R"({"type":"unpaired"})");
+        r.server(R"({"type":"paired"})");
+      },
+  };
+  for (const auto& batch : batches) {
+    WakeRig r;
+    r.arm();
+    r.app.on_wake();
+    r.fake.spk_draining = true;
+    batch(r);
+    r.fake.spk_draining = false;
+    r.advance(100);
+    CHECK(!r.fake.mic_on);
+    CHECK(r.fake.last("audio.start") == nullptr);
+    CHECK(r.wake.armed());  // a fresh wake is needed
+    r.app.on_wake();
+    r.advance(10);
+    CHECK(r.fake.mic_on);
+    CHECK_EQ(r.app.wake_stats().detections, uint32_t(2));
+  }
+
+  {  // The connection lost during the beep: back online, no recording.
+    WakeRig r;
+    r.arm();
+    r.app.on_wake();
+    r.fake.spk_draining = true;
+    r.app.on_transport_closed("lost");
+    r.fake.spk_draining = false;
+    reconnect(r);
+    r.advance(100);
+    CHECK(!r.fake.mic_on);
+    CHECK(r.fake.last("audio.start") == nullptr);
+    CHECK(r.wake.armed());
+  }
+
+  // An alarm going off during the beep.
+  WakeRig r;
+  r.arm();
+  r.server(R"({"type":"action","id":"t1","name":"timer.start","args":{"seconds":1}})");
+  r.advance(900);
+  r.app.on_wake();
+  r.fake.spk_draining = true;
+  r.advance(200);
+  CHECK(r.app.screen() == hg::Screen::Alarm);
+  r.fake.spk_draining = false;
+  r.advance(100);
+  CHECK(!r.fake.mic_on);
+  CHECK(r.fake.last("audio.start") == nullptr);
+}
+
+TEST("wake: a beep that can't play drops the wake without recording, and it listens again") {
+  WakeRig r;
+  r.arm();
+  r.fake.spk_refuse = true;
+  r.app.on_wake();
+  r.advance(100);
+  CHECK(!r.fake.mic_on);
+  CHECK(r.fake.last("audio.start") == nullptr);
+  CHECK_EQ(r.app.wake_stats().detections, uint32_t(0));
+  CHECK(r.wake.armed());
+  r.fake.spk_refuse = false;
+  r.app.on_wake();
+  r.advance(10);
+  CHECK(r.fake.mic_on);
+}
+
 TEST("wake: a wake recording held through a lost connection is sent again as a wake") {
   hg::DeviceProfile p = WakeRig::wake_profile();
   p.recording_alloc = std::malloc;
@@ -9431,4 +9541,7 @@ TEST("wake: hello announces the phrase; a board without a wake word has no setti
   WakeRig no_detector;  // a phrase but no detector
   no_detector.hal.wake = nullptr;
   check_absent(no_detector);
+  WakeRig no_speaker;  // nothing to beep with
+  no_speaker.hal.speaker = nullptr;
+  check_absent(no_speaker);
 }

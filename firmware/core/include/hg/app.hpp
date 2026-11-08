@@ -66,7 +66,8 @@ struct DeviceProfile {
   // and talk from a dark screen (`wake_talk`). Boards without one hide all three.
   bool talk_key = true;
   // The phrase the board's wake word detector (Hal::wake) listens for, as the user says it
-  // ("Hey Hermes"); null: no wake word. With both, the board offers the `wake_word` setting.
+  // ("Hey Hermes"); null: no wake word. With both and a speaker for the beep, the board offers
+  // the `wake_word` setting.
   const char* wake_phrase = nullptr;
   // Board-specific settings the console accepts besides the core ones. Changes
   // reach the port through App::on_setting_changed.
@@ -158,7 +159,8 @@ class App {
   void on_mic_samples(const int16_t* samples, size_t count);
   // The wake word detector (Hal::wake) heard its phrase. Ignored unless the detector should be
   // armed now; otherwise lights the screen, beeps, and once the beep has played starts a
-  // hands-free turn like tap-to-talk (audio.start mode "wake").
+  // hands-free turn like tap-to-talk (audio.start mode "wake"). No beep, no turn; CANCEL during
+  // the beep, or anything that disarms the detector meanwhile, drops the wake.
   void on_wake();
   WakeStats wake_stats() const { return {wake_armed_, wake_detections_, wake_no_speech_}; }
 
@@ -430,13 +432,18 @@ class App {
   bool can_talk() const;
   // `wake`: the wake word started it (hands-free, audio.start mode "wake", no hint on no speech).
   void start_listening(bool hands_free, bool wake = false);
-  // The wake word (Hal::wake): the board has one, and whether a wake may start a turn now. With
-  // `speaker`, the speaker must be quiet too (arming); without, a wake's own beep may still play.
-  bool wake_supported() const { return hal_.wake && profile_.wake_phrase; }
+  // The wake word (Hal::wake): the board has one, and a speaker for its beep (a wake beeps, then
+  // records), and whether a wake may start a turn now. With `speaker`, the speaker must be quiet
+  // too (arming); without, a wake's own beep may still play.
+  bool wake_supported() const { return hal_.wake && profile_.wake_phrase && hal_.speaker; }
   bool wake_ready(bool speaker) const;
   // Arms or disarms the detector, telling the port only of a change.
   void set_wake_armed(bool armed);
   void wake_tick();
+  // A pending wake (on_wake → its beep → wake_tick starts the recording) ends without recording.
+  // `stop_beep` cuts its beep short (CANCEL). update_model() ends one the new state no longer
+  // allows (wake_ready), so a change undone before the next tick still ends it.
+  void drop_pending_wake(std::string_view why, bool stop_beep = false);
   void finish_listening();
   void cancel_listening(std::string_view why);
   // The recording buffer (profile_.recording_alloc): see rec_ below.

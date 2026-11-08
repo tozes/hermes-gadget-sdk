@@ -1592,6 +1592,10 @@ void App::on_button(Button button, bool pressed, bool touch) {
       // Short press acts on release; holding past kNewSessionHoldMs starts a new session
       // instead (fired from tick(), so the user gets feedback without letting go).
       if (pressed) {
+        if (wake_pending_) {  // the press takes the wake back; its release does nothing
+          drop_pending_wake("cancelled", true);
+          break;
+        }
         cancel_held_ = true;
         cancel_down_at_ = now();
         cancel_long_fired_ = false;
@@ -1762,7 +1766,7 @@ void App::set_wake_armed(bool armed) {
 void App::wake_tick() {
   if (wake_pending_) {
     if (!wake_ready(false)) {
-      wake_pending_ = false;  // something took over during the beep
+      drop_pending_wake("taken over");
     } else if (!speaking() || static_cast<int32_t>(now() - wake_pending_until_) >= 0) {
       start_listening(true, true);  // stops a beep still playing at the deadline
       update_model();
@@ -1773,16 +1777,28 @@ void App::wake_tick() {
   if (wake_armed_ != was) update_model();  // the indicator
 }
 
+void App::drop_pending_wake(std::string_view why, bool stop_beep) {
+  wake_pending_ = false;
+  // Only the beep: a reply's audio (in_stream_) that took over keeps playing.
+  if (stop_beep && hal_.speaker && in_stream_ < 0 && hal_.speaker->busy()) hal_.speaker->abort();
+  log(LogLevel::Info, "wake word dropped: " + std::string(why));
+}
+
 void App::on_wake() {
   if (!wake_armed_ || wake_pending_ || !wake_ready(true)) {
     log(LogLevel::Debug, "wake word ignored: not armed");
     return;
   }
-  ++wake_detections_;
-  log(LogLevel::Info, "wake word heard");
   wake_display();
   set_wake_armed(false);  // the detector must not hear its own beep
-  play_tones(kWakeTones, sizeof(kWakeTones) / sizeof(kWakeTones[0]));
+  // No beep, no recording: the beep tells the user the microphone is about to stream.
+  // wake_tick() arms the detector again for a fresh wake.
+  if (!play_tones(kWakeTones, sizeof(kWakeTones) / sizeof(kWakeTones[0]))) {
+    log(LogLevel::Warn, "wake word dropped: the beep couldn't play");
+    return;
+  }
+  ++wake_detections_;
+  log(LogLevel::Info, "wake word heard");
   wake_pending_ = true;
   wake_pending_until_ = now() + kWakeToneWaitMs;
   update_model();
@@ -2456,6 +2472,8 @@ void App::tick() {
 }
 
 void App::update_model() {
+  // Every change of state ends here: a pending wake it no longer allows ends with it.
+  if (wake_pending_ && !wake_ready(false)) drop_pending_wake("taken over");
   UiModel& m = model_;
   // A recording held through a lost connection keeps its screen over the connecting ones.
   const bool held = recording_held() && (mode_ == Mode::Listening || mode_ == Mode::Thinking);
@@ -2981,7 +2999,7 @@ std::string App::console(std::string_view raw) {
     std::string key = rest.substr(0, ks);
     if (!known_setting(key)) return "@error unknown key";
     if (cmd == "get") {
-      std::string v = setting(key);
+      std::string v = key == "wake_word" ? setting(key, "off") : setting(key);
       json::Value out = json::Value::object();
       out.set("key", key).set("value", is_secret(key) && !v.empty() ? std::string("<set>") : v);
       return "@value " + out.dump();
