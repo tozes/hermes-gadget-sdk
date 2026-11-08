@@ -65,6 +65,9 @@ struct DeviceProfile {
   // the touchscreen be left out of talking (`touch_talk`); it can double-press home (`double_home`)
   // and talk from a dark screen (`wake_talk`). Boards without one hide all three.
   bool talk_key = true;
+  // The phrase the board's wake word detector (Hal::wake) listens for, as the user says it
+  // ("Hey Hermes"); null: no wake word. With both, the board offers the `wake_word` setting.
+  const char* wake_phrase = nullptr;
   // Board-specific settings the console accepts besides the core ones. Changes
   // reach the port through App::on_setting_changed.
   std::vector<std::string> extra_settings;
@@ -99,6 +102,14 @@ struct Action {
   json::Value params = json::Value::object();
   // Return true on success and fill `result`; on failure set `error`.
   std::function<bool(const json::Value& args, json::Value& result, std::string& error)> handler;
+};
+
+// The wake word for the port's `diag`: whether the detector is armed now, the wakes it acted
+// on since start-up, and the wake turns that heard no speech (possible false wakes).
+struct WakeStats {
+  bool armed;
+  uint32_t detections;
+  uint32_t no_speech;
 };
 
 // The temporary Wi-Fi setup network, as the port knows it. Lets the setup
@@ -145,6 +156,11 @@ class App {
   // times a second from the thread that calls tick().
   void on_motion(int16_t x_mg, int16_t y_mg, int16_t z_mg);
   void on_mic_samples(const int16_t* samples, size_t count);
+  // The wake word detector (Hal::wake) heard its phrase. Ignored unless the detector should be
+  // armed now; otherwise lights the screen, beeps, and once the beep has played starts a
+  // hands-free turn like tap-to-talk (audio.start mode "wake").
+  void on_wake();
+  WakeStats wake_stats() const { return {wake_armed_, wake_detections_, wake_no_speech_}; }
 
   // --- device features ------------------------------------------------------
   // Sends typed text as a user message (keyboards, simulator, console).
@@ -412,7 +428,15 @@ class App {
   bool send(const json::Value& msg);
   void send_hello();
   bool can_talk() const;
-  void start_listening(bool hands_free);
+  // `wake`: the wake word started it (hands-free, audio.start mode "wake", no hint on no speech).
+  void start_listening(bool hands_free, bool wake = false);
+  // The wake word (Hal::wake): the board has one, and whether a wake may start a turn now. With
+  // `speaker`, the speaker must be quiet too (arming); without, a wake's own beep may still play.
+  bool wake_supported() const { return hal_.wake && profile_.wake_phrase; }
+  bool wake_ready(bool speaker) const;
+  // Arms or disarms the detector, telling the port only of a change.
+  void set_wake_armed(bool armed);
+  void wake_tick();
   void finish_listening();
   void cancel_listening(std::string_view why);
   // The recording buffer (profile_.recording_alloc): see rec_ below.
@@ -535,7 +559,7 @@ class App {
   // `language` is auto: follow the language Hermes sends in `welcome` (English until it does).
   bool lang_auto_ = false;
   std::optional<i18n::Lang> hermes_lang_;  // from the last `welcome` that named one this firmware has
-  enum class Menu : uint8_t { Closed, Volume, Brightness, TalkMode, TouchTalk, Profile, ProfileGrid, Microphone, Speaker, Display, Inputs,
+  enum class Menu : uint8_t { Closed, Volume, Brightness, TalkMode, TouchTalk, WakeWord, Profile, ProfileGrid, Microphone, Speaker, Display, Inputs,
                               Info, Power, BatteryAlert, BatteryAlertSound, ChargingNotice, ChargingSound, ChargedNotice, ChargedSound, WifiDeepSleep, IdleTimer, TouchWake, FaceDownSleep, Clock, PowerOff, WifiSetup, Phone, Language, DoubleHome, WakeTalk, Back };
   enum class HardwareCheck : uint8_t { None, Microphone, Speaker, Display, Inputs };
   Menu menu_ = Menu::Closed;
@@ -644,6 +668,11 @@ class App {
   bool wifi_deep_sleep_ = true;       // the `wifi_deep_sleep` setting
   bool wake_talk_ = false;            // the `wake_talk` setting
   bool touch_talk_ = true;            // the `touch_talk` setting
+  // The wake word (Hal::wake): the `wake_word` setting, USB power as last polled (power_tick),
+  // what the port was last told, a wake waiting for its beep to finish (and the latest it waits),
+  // and the counters behind wake_stats().
+  bool wake_word_ = false, wake_usb_ = false, wake_armed_ = false, wake_pending_ = false;
+  uint32_t wake_pending_until_ = 0, wake_detections_ = 0, wake_no_speech_ = 0;
   bool reply_while_face_down_ = false;  // a reply arrived while dark; show it on the turn-over
   uint8_t wake_buttons_ = 0;
 
@@ -703,6 +732,7 @@ class App {
   Mode mode_ = Mode::Idle;
   uint32_t mode_since_ = 0;
   bool hands_free_ = false;
+  bool wake_turn_ = false;  // the wake word started this recording
   uint8_t mic_stream_ = 0;
   uint32_t mic_unsent_ = 0;  // frames of this recording the transport refused (or, buffered, that didn't fit)
   // This recording goes through rec_. rec_live_: the current connection carries its upload

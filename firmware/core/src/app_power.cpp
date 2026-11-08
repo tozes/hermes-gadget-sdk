@@ -328,9 +328,12 @@ void App::power_tick() {
     power_key_polled_at_ = now();
     if (hal_.power->take_key_press()) on_power_key();
     // Dozing needs the battery to be the only supply; check as often as the key
-    // while the screen is dark, so plugging in ends a doze within ~100 ms.
+    // while the screen is dark, so plugging in ends a doze within ~100 ms. The wake
+    // word listens only on USB (unknown is not USB): unplugging disarms it as quickly.
+    std::optional<bool> external;
+    if (display_sleeping_ || wake_word_) external = hal_.power->external_power();
+    wake_usb_ = wake_word_ && external == true;
     if (display_sleeping_) {
-      const auto external = hal_.power->external_power();
       on_battery_ = external.has_value() && !*external;
       if (external.has_value()) note_supply(external);  // a dark screen lights at once on USB
     }
