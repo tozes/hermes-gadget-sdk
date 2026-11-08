@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <new>
 
+#include "es7210_gain.hpp"
 #include "esp_console.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -408,7 +409,17 @@ void report(hg::json::Value& r, const hg::WakeStats& stats) {
   if (!Detector::instance) return;
   hg::json::Value wake = hg::json::Value::object();
   wake.set("armed", stats.armed).set("detections", static_cast<unsigned>(stats.detections))
-      .set("no_speech", static_cast<unsigned>(stats.no_speech));
+      .set("no_speech", static_cast<unsigned>(stats.no_speech))
+      .set("gain_db", static_cast<double>(hg::es7210_gain_step(stats.gain_db)))  // what the ES7210 gets
+      .set("floor", static_cast<double>(stats.floor));
+  if (const auto& t = stats.last_turn) {
+    wake.set("last_turn", hg::json::Value::object()
+                              .set("speech", t->speech)
+                              .set("speech_ms", static_cast<unsigned>(t->speech_ms))
+                              .set("rms_mean", std::round(static_cast<double>(t->rms_mean)))
+                              .set("rms_max", std::round(static_cast<double>(t->rms_max)))
+                              .set("peak", t->peak));
+  }
   Detector::instance->report(wake);
   r.set("wake", wake);
 }

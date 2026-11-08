@@ -441,7 +441,9 @@ extern "C" void app_main(void) {
     if (board.light_sleep && g_codec.mic_link().switchable) g_codec_speaker.allow_power_down(g_codec.mic_link().format);
   }
 #if CONFIG_HG_WAKE_WORD
-  if (board.wake_word && hal.mic == &g_codec_mic) hal.wake = hgp::wake::begin(g_codec_mic);
+  // An ES7210 only: the wake word's gain is in its steps (CodecMic::set_gain_db).
+  if (board.wake_word && hal.mic == &g_codec_mic && board.codec.mic == hgp::MicCodec::Es7210)
+    hal.wake = hgp::wake::begin(g_codec_mic);
 #endif
   if (hal.speaker) hal.speaker_decoder = &g_opus;  // Opus replies when Hermes offers them
   const bool imu = peripherals_ready && board.imu.enabled && g_motion.begin(board.imu, i2c_bus);

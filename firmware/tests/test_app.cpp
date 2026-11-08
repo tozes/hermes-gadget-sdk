@@ -143,8 +143,18 @@ struct FakeHal : hg::Display, hg::AudioIn, hg::AudioOut, hg::Transport, hg::Stor
 
   // Mic
   bool mic_on = false;
-  bool start(uint32_t) override { return mic_on = true; }
+  std::optional<float> mic_gain;          // what set_gain_db last asked for (nullopt: the board's)
+  std::optional<float> mic_gain_at_start;  // ...when the last recording started
+  int mic_gain_calls = 0;
+  bool start(uint32_t) override {
+    mic_gain_at_start = mic_gain;
+    return mic_on = true;
+  }
   void stop() override { mic_on = false; }
+  void set_gain_db(std::optional<float> db) override {
+    mic_gain = db;
+    ++mic_gain_calls;
+  }
 
   // Speaker
   bool spk_open = false;
@@ -9036,11 +9046,14 @@ struct FakeWake : hg::WakeWord {
   const bool* mic_on = nullptr;       // the board's microphone
   bool mic_was_on_at_disarm = false;  // a recording started before the detector let go
   uint32_t current = 0;               // what a detection now would carry
+  const std::optional<float>* mic_gain = nullptr;  // the board's microphone gain...
+  std::optional<float> gain_at_arm;                // ...when it was last armed
   uint32_t session() const override { return current; }
   void set_armed(bool armed) override {
     calls.push_back(armed);
     ++current;
     if (!armed && mic_on && *mic_on) mic_was_on_at_disarm = true;
+    if (armed && mic_gain) gain_at_arm = *mic_gain;
   }
   bool armed() const { return !calls.empty() && calls.back(); }
 };
@@ -9065,6 +9078,7 @@ struct WakeRig : Rig {
     hal.wake = &wake;
     hal.power = &power;
     wake.mic_on = &fake.mic_on;
+    wake.mic_gain = &fake.mic_gain;
   }
   static hg::DeviceProfile wake_profile() {
     hg::DeviceProfile p = profile("ws://hermes.local:8765/gadget");
@@ -9580,6 +9594,12 @@ TEST("wake: hello announces the phrase; a board without a wake word has no setti
     CHECK_EQ(w.app.console("get wake_word"), std::string("@error unknown key"));
     CHECK_EQ(w.app.console("set wake_word on"), std::string("@error unknown key"));
     CHECK(w.app.console("help").find(" wake_word") == std::string::npos);
+    for (const char* key : {"wake_gain", "wake_floor"}) {
+      CHECK_EQ(w.app.console(std::string("get ") + key), std::string("@error unknown key"));
+      CHECK_EQ(w.app.console(std::string("set ") + key + " 30"), std::string("@error unknown key"));
+      CHECK(w.app.console("help").find(std::string(" ") + key) == std::string::npos);
+    }
+    CHECK_EQ(w.fake.mic_gain_calls, 0);  // the board's gain throughout
     CHECK(w.app.open_settings());
     for (const auto& row : w.app.model().settings) CHECK(row.label.rfind("Wake word", 0) != 0);
     w.app.close_settings();
@@ -9596,4 +9616,179 @@ TEST("wake: hello announces the phrase; a board without a wake word has no setti
   WakeRig no_speaker;  // nothing to beep with
   no_speaker.hal.speaker = nullptr;
   check_absent(no_speaker);
+}
+
+// Far-field wake turns: the 1.75C's microphone pops for its first 250 ms (RMS 1,100-1,600), and
+// speech 1 m away is RMS 100-260 at the board's 24 dB, under its close-talk floor of 500.
+namespace {
+
+// A wake that has beeped and started its recording.
+void start_wake_turn(WakeRig& r) {
+  r.app.on_wake(r.wake.session());
+  r.advance(10);
+  CHECK(r.fake.mic_on);
+}
+
+// Hermes answers the turn and ends it: the detector arms again on the next tick.
+void answer_turn(WakeRig& r) {
+  r.server(R"({"type":"turn.start","turn":"a1"})");
+  r.server(R"({"type":"reply","turn":"a1","text":"Hi."})");
+  r.server(R"({"type":"turn.end","turn":"a1","outcome":"success"})");
+  r.advance(200);
+}
+
+}  // namespace
+
+TEST("wake: the microphone's start-up pop is not speech; a pop and then silence cancels as no speech") {
+  WakeRig r;
+  r.arm();
+  start_wake_turn(r);
+  r.feed(1500, 2);  // the pop
+  r.feed(10, 60);   // nobody speaks, to the no-speech limit
+  CHECK(!r.fake.mic_on);
+  CHECK(r.fake.last("audio.end") == nullptr);
+  const Value* cancel = r.fake.last("audio.cancel");
+  CHECK(cancel && (*cancel)["reason"].as_string() == "no speech");
+  CHECK_EQ(r.app.wake_stats().no_speech, uint32_t(1));
+  const auto turn = r.app.wake_stats().last_turn;
+  CHECK(turn && !turn->speech);
+  CHECK(turn && turn->rms_max == 10.0f && turn->peak == 10);  // the pop is in neither
+}
+
+TEST("wake: quiet far speech after the pop is heard, and the pause after it ends the turn") {
+  WakeRig r;
+  r.arm();
+  CHECK(!r.app.wake_stats().last_turn);
+  start_wake_turn(r);
+  r.feed(1500, 2);  // the pop
+  r.feed(10, 3);
+  for (int i = 0; i < 5; ++i) {  // a second of speech at RMS 160-240
+    r.feed(160, 1);
+    r.feed(240, 1);
+  }
+  CHECK(r.fake.mic_on);  // the pop didn't end it early
+  r.feed(10, 12);        // the pause
+  CHECK(!r.fake.mic_on);
+  CHECK(r.fake.last("audio.end") != nullptr);
+  CHECK(r.fake.last("audio.cancel") == nullptr);
+  const auto turn = r.app.wake_stats().last_turn;
+  CHECK(turn && turn->speech);
+  CHECK(turn && turn->speech_ms == 1000);
+  CHECK(turn && turn->rms_mean == 200.0f && turn->rms_max == 240.0f && turn->peak == 240);
+  CHECK(std::find(r.fake.logs.begin(), r.fake.logs.end(),
+                  "wake turn: heard speech, 1000 ms of speech blocks, block RMS mean 200 max 240, peak 240 "
+                  "(floor 150, wake_gain 30.0 dB)") != r.fake.logs.end());
+}
+
+TEST("wake: a tap turn keeps the board's floor and counts its start, with a low wake_floor") {
+  WakeRig r;
+  r.app.console("set talk_mode tap");
+  r.arm();
+  CHECK_EQ(r.app.console("set wake_floor 30"), std::string("@ok wake_floor"));
+  r.app.on_button(hg::Button::Talk, true);
+  r.app.on_button(hg::Button::Talk, false);
+  r.feed(240, 70);  // far speech is under the board's 500
+  CHECK(!r.fake.mic_on);
+  CHECK_EQ(r.app.model().hint, std::string("Didn't hear anything"));
+  r.advance(3000);
+  r.app.on_button(hg::Button::Talk, true);
+  r.app.on_button(hg::Button::Talk, false);
+  r.feed(1000, 3);  // speech in its first 300 ms counts
+  r.feed(10, 12);
+  CHECK(!r.fake.mic_on);
+  CHECK(r.fake.last("audio.end") != nullptr);
+  CHECK(!r.app.wake_stats().last_turn);  // not a wake turn
+}
+
+TEST("wake: the wake gain while armed, through a wake's beep and its turn; the board's for TALK and when disarmed") {
+  WakeRig r;
+  r.arm();
+  CHECK(r.wake.armed());
+  CHECK(r.wake.gain_at_arm == std::optional<float>(30.0f));  // before the detector's first chunk
+  const int calls = r.fake.mic_gain_calls;
+  r.advance(5000);
+  CHECK_EQ(r.fake.mic_gain_calls, calls);  // told only of a change
+
+  r.app.on_wake(r.wake.session());
+  r.fake.spk_draining = true;  // the beep
+  r.advance(300);
+  CHECK(r.fake.mic_gain == std::optional<float>(30.0f));
+  r.fake.spk_draining = false;
+  r.advance(10);
+  CHECK(r.fake.mic_on);
+  CHECK(r.fake.mic_gain_at_start == std::optional<float>(30.0f));
+  r.feed(1000, 10);
+  r.feed(10, 12);
+  CHECK(!r.fake.mic_on);
+  CHECK(!r.fake.mic_gain);  // the turn went to Hermes: the board's gain
+  answer_turn(r);
+  CHECK(r.wake.armed());
+  CHECK(r.fake.mic_gain == std::optional<float>(30.0f));
+
+  r.app.on_button(hg::Button::Talk, true);  // hold to talk while armed
+  CHECK(r.fake.mic_on);
+  CHECK(!r.fake.mic_gain_at_start);
+  r.feed(1000, 5);
+  r.app.on_button(hg::Button::Talk, false);
+  answer_turn(r);
+  CHECK(r.fake.mic_gain == std::optional<float>(30.0f));
+
+  r.app.console("set talk_mode tap");  // a tap turn from a wake's beep
+  r.app.on_wake(r.wake.session());
+  r.fake.spk_draining = true;
+  r.app.on_button(hg::Button::Talk, true);
+  r.app.on_button(hg::Button::Talk, false);
+  CHECK(r.fake.mic_on);
+  CHECK(!r.fake.mic_gain_at_start);
+  r.fake.spk_draining = false;
+  r.feed(1000, 5);
+  r.feed(10, 12);
+  answer_turn(r);
+  CHECK(r.wake.armed());
+
+  CHECK_EQ(r.app.console("set wake_gain 36"), std::string("@ok wake_gain"));  // at once while armed
+  CHECK(r.fake.mic_gain == std::optional<float>(36.0f));
+  r.power.usb = false;  // disarmed
+  r.advance(100);
+  CHECK(!r.wake.armed());
+  CHECK(!r.fake.mic_gain);
+}
+
+TEST("wake: wake_gain and wake_floor, with their defaults, ranges and saved values") {
+  WakeRig r;
+  r.bring_online(true);
+  CHECK_EQ(r.app.console("get wake_gain"), std::string(R"(@value {"key":"wake_gain","value":"30"})"));
+  CHECK_EQ(r.app.console("get wake_floor"), std::string(R"(@value {"key":"wake_floor","value":"150"})"));
+  CHECK(r.app.console("help").find(" wake_gain wake_floor") != std::string::npos);
+  for (const char* bad : {"-1", "37.6", "abc", "30dB", "nan", "inf"})
+    CHECK_EQ(r.app.console(std::string("set wake_gain ") + bad), std::string("@error wake_gain must be 0..37.5 dB"));
+  for (const char* bad : {"29", "3001", "loud"})
+    CHECK_EQ(r.app.console(std::string("set wake_floor ") + bad), std::string("@error wake_floor must be 30..3000 (RMS)"));
+  CHECK_EQ(r.app.console("set wake_gain 37.5"), std::string("@ok wake_gain"));
+  CHECK_EQ(r.app.console("set wake_floor 300"), std::string("@ok wake_floor"));
+  CHECK_EQ(r.fake.kv["wake_gain"], std::string("37.5"));
+  CHECK_EQ(r.fake.kv["wake_floor"], std::string("300"));
+  CHECK_EQ(r.app.wake_stats().gain_db, 37.5f);
+  CHECK_EQ(r.app.wake_stats().floor, 300.0f);
+  // Not settings-menu items.
+  CHECK(r.app.open_settings());
+  for (const auto& row : r.app.model().settings) CHECK(row.label.find("gain") == std::string::npos);
+  r.app.close_settings();
+
+  // Saved: after a restart the detector arms at that gain, and a wake turn uses that floor.
+  WakeRig again;
+  again.fake.kv = r.fake.kv;
+  again.arm();
+  CHECK(again.wake.gain_at_arm == std::optional<float>(37.5f));
+  start_wake_turn(again);
+  again.feed(10, 3);
+  again.feed(240, 60);  // under the floor of 300: nobody spoke
+  CHECK(!again.fake.mic_on);
+  const Value* cancel = again.fake.last("audio.cancel");
+  CHECK(cancel && (*cancel)["reason"].as_string() == "no speech");
+
+  // Cleared: the defaults again.
+  CHECK_EQ(r.app.console("set wake_gain"), std::string("@ok wake_gain"));
+  CHECK_EQ(r.app.console("get wake_gain"), std::string(R"(@value {"key":"wake_gain","value":"30"})"));
+  CHECK_EQ(r.app.wake_stats().gain_db, 30.0f);
 }

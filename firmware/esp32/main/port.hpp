@@ -520,6 +520,13 @@ class CodecMic final : public hg::AudioIn {
   using Sink = void (*)(const int16_t* pcm);
   void set_sink(Sink sink) { sink_ = sink; }
   void set_listening(bool on);
+  // The wake word's gain (the core: armed, a wake's beep and its turn), rounded down to a step
+  // the ES7210 driver sets (hg::es7210_gain_step; the wake word runs only on an ES7210,
+  // main.cpp); nullopt: the board's own (MicLink::gain_db). Only the mic task uses the codec
+  // handle, so it writes the new gain itself, between two reads: a chunk is never read across
+  // the change, and the chunks after it carry what the I2S DMA already held (up to its buffer,
+  // tens of ms) at the old gain. A powered-down ADC gets it when it powers up.
+  void set_gain_db(std::optional<float> db) override;
 #endif
 
  private:
@@ -533,6 +540,7 @@ class CodecMic final : public hg::AudioIn {
 #if CONFIG_HG_WAKE_WORD
   Sink sink_ = nullptr;
   std::atomic<bool> listening_{false};
+  std::atomic<float> gain_db_{0};  // what the mic task gives the ADC next (set_gain_db)
 #endif
 };
 

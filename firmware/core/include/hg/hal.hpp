@@ -69,6 +69,12 @@ class AudioIn {
   virtual ~AudioIn() = default;
   virtual bool start(uint32_t sample_rate) = 0;
   virtual void stop() = 0;
+  // The microphone's analog gain in dB from now on; nullopt: the board's own. Only the wake word
+  // uses it (App: armed, a wake's beep and its turn get the `wake_gain` setting, anything else the
+  // board's gain), so only a port with a WakeWord needs it. The core sets it before
+  // WakeWord::set_armed(true) and before start(), so the detector and the recording get it from
+  // their first chunks on, give or take the audio the port already had in flight.
+  virtual void set_gain_db(std::optional<float> db) { (void)db; }
 };
 
 // Speaker: begin() a stream, write() mono PCM16 (non-blocking, the port

@@ -106,11 +106,15 @@ struct Action {
 };
 
 // The wake word for the port's `diag`: whether the detector is armed now, the wakes it acted
-// on since start-up, and the wake turns that heard no speech (possible false wakes).
+// on since start-up, the wake turns that heard no speech (possible false wakes), the `wake_gain`
+// and `wake_floor` settings, and what the last wake turn heard (none yet: nullopt).
 struct WakeStats {
   bool armed;
   uint32_t detections;
   uint32_t no_speech;
+  float gain_db;
+  float floor;
+  std::optional<VadLevel> last_turn;
 };
 
 // The temporary Wi-Fi setup network, as the port knows it. Lets the setup
@@ -164,7 +168,9 @@ class App {
   // like tap-to-talk (audio.start mode "wake"). No beep, no turn; CANCEL during the beep, or
   // anything that disarms the detector meanwhile, drops the wake.
   void on_wake(uint32_t session);
-  WakeStats wake_stats() const { return {wake_armed_, wake_detections_, wake_no_speech_}; }
+  WakeStats wake_stats() const {
+    return {wake_armed_, wake_detections_, wake_no_speech_, wake_gain_db_, wake_floor_, wake_last_turn_};
+  }
 
   // --- device features ------------------------------------------------------
   // Sends typed text as a user message (keyboards, simulator, console).
@@ -447,6 +453,12 @@ class App {
   // `stop_beep` cuts its beep short (CANCEL). update_model() ends one the new state no longer
   // allows (wake_ready), so a change undone before the next tick still ends it.
   void drop_pending_wake(std::string_view why, bool stop_beep = false);
+  // The microphone's gain (AudioIn::set_gain_db): `wake_gain` for the wake word, else the
+  // board's own; tells the port only of a change. update_model() keeps it in line with the
+  // state; arming and start_listening set it first, before the audio they want it for.
+  void set_mic_gain(bool wake);
+  // Logs what a hands-free recording's VAD heard, and keeps a wake turn's for wake_stats().
+  void note_turn_level();
   void finish_listening();
   void cancel_listening(std::string_view why);
   // The recording buffer (profile_.recording_alloc): see rec_ below.
@@ -683,6 +695,11 @@ class App {
   // and the counters behind wake_stats().
   bool wake_word_ = false, wake_usb_ = false, wake_armed_ = false, wake_pending_ = false;
   uint32_t wake_pending_until_ = 0, wake_detections_ = 0, wake_no_speech_ = 0;
+  // The `wake_gain` (dB) and `wake_floor` (RMS) settings, the gain the microphone was last
+  // given (nullopt: the board's own), and what the last wake turn heard.
+  float wake_gain_db_ = 0, wake_floor_ = 0;
+  std::optional<float> mic_gain_;
+  std::optional<VadLevel> wake_last_turn_;
   bool reply_while_face_down_ = false;  // a reply arrived while dark; show it on the turn-over
   uint8_t wake_buttons_ = 0;
 

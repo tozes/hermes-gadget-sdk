@@ -10,6 +10,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "es7210_gain.hpp"
 #include "freertos/task.h"
 #include "mic_power.hpp"
 #include "speaker_queue.hpp"
@@ -191,6 +192,9 @@ bool CodecMic::begin(esp_codec_dev_handle_t dev, bool rmnm, const CodecAudio::Mi
   dev_ = dev;
   link_ = link;
   rmnm_ = rmnm;
+#if CONFIG_HG_WAKE_WORD
+  gain_db_ = link.gain_db;
+#endif
   if (rmnm) {
     raw_ = static_cast<int16_t*>(heap_caps_malloc(kMicChunk * 4 * sizeof(int16_t), MALLOC_CAP_8BIT));
     if (!raw_) return false;
@@ -222,9 +226,24 @@ void CodecMic::task(void* arg) {
         ESP_LOGW(TAG, "microphone did not start");
         return false;
       }
+#if CONFIG_HG_WAKE_WORD
+      gain = mic->gain_db_.load();
+      esp_codec_dev_set_in_gain(mic->dev_, gain);
+#else
       esp_codec_dev_set_in_gain(mic->dev_, mic->link_.gain_db);
+#endif
       return true;
     }
+#if CONFIG_HG_WAKE_WORD
+    // Between two reads, on a powered ADC: a gain set_gain_db asked for since the last chunk.
+    float gain = 0;  // what the ADC has
+    void apply_gain() {
+      const float want = mic->gain_db_.load();
+      if (want == gain) return;
+      esp_codec_dev_set_in_gain(mic->dev_, want);
+      gain = want;
+    }
+#endif
     void power_down() { esp_codec_dev_close(mic->dev_); }
     void drain() {
       // The receive channel kept running for the speaker; skip its stale buffers.
@@ -252,7 +271,11 @@ void CodecMic::task(void* arg) {
   } ops{self};
   hg::MicPower power(self->link_.switchable);
 #if CONFIG_HG_WAKE_WORD
-  for (;;) power.turn(self->capturing_.load(), ops, pcm, self->listening_.load());
+  ops.gain = self->link_.gain_db;  // CodecAudio::begin opened it with that
+  for (;;) {
+    if (power.on()) ops.apply_gain();  // this task is the codec handle's only user
+    power.turn(self->capturing_.load(), ops, pcm, self->listening_.load());
+  }
 #else
   for (;;) power.turn(self->capturing_.load(), ops, pcm);
 #endif
@@ -262,6 +285,13 @@ void CodecMic::task(void* arg) {
 void CodecMic::set_listening(bool on) {
   listening_ = on;
   if (task_) xTaskNotifyGive(task_);  // wakes a powered-down mic task
+}
+
+void CodecMic::set_gain_db(std::optional<float> db) {
+  const float gain = db ? hg::es7210_gain_step(*db) : link_.gain_db;
+  gain_db_ = gain;
+  if (db) ESP_LOGI(TAG, "microphone gain %.1f dB (wake_gain %.1f)", static_cast<double>(gain), static_cast<double>(*db));
+  else ESP_LOGI(TAG, "microphone gain %.1f dB (the board's)", static_cast<double>(gain));
 }
 #endif
 

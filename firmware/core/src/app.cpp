@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "hg/crypto.hpp"
@@ -64,6 +65,20 @@ constexpr uint32_t kMicFrameMs = 40;
 // it isn't in the recording; a speaker that never reports idle holds the turn this long at most.
 constexpr Tone kWakeTones[] = {{880, 60, 20, 7000}, {1320, 90, 0, 7000}};
 constexpr uint32_t kWakeToneWaitMs = 1500;
+// A wake turn's VAD leaves out its first 300 ms: the microphone powers up for the recording and
+// its start-up pop (the 1.75C's ES7210: RMS 1,100-1,600 in the first 250 ms of every recording,
+// 6-25 in the next quarter-seconds of silence) would otherwise count as speech, ending a turn
+// nobody spoke in or one before the user has finished. The recording still sends it.
+constexpr uint32_t kWakeStartIgnoreMs = 300;
+// `wake_gain`, the microphone's gain while the wake word listens and through a wake turn, in dB.
+// 30 dB, +6 over the 1.75C's 24 dB: speech at 1 m (RMS 100-260, peak 4,841 at 24 dB) doubles
+// while a peak of 11,513 (close talk at 24 dB) stays under full scale at 23,000. The ES7210
+// goes to 37.5 dB; a port rounds down to its codec's steps (AudioIn::set_gain_db).
+constexpr float kWakeGainDb = 30.0f, kWakeGainMaxDb = 37.5f;
+// `wake_floor`, a wake turn's quietest speech block (RMS), instead of the board's close-talk
+// DeviceProfile::vad_min_rms; the VAD's noise ratio still raises it in a noisy room. 150 at
+// 30 dB: 3 times a quiet room (6-25 at 24 dB, so up to 50), and under speech at 1 m (150-515).
+constexpr float kWakeFloorRms = 150.0f, kWakeFloorMinRms = 30.0f, kWakeFloorMaxRms = 3000.0f;
 constexpr size_t kOtaAckBytes = 16 * 1024;  // a firmware update acknowledges every 16 KB written
 constexpr uint32_t kOtaIdleMs = 30000;      // ...and is abandoned when no data comes for this long
 constexpr uint32_t kOtaRestartMs = 1000;    // time for ota.done to leave before the restart
@@ -72,7 +87,16 @@ constexpr size_t kBackoffSteps = sizeof(kBackoffMs) / sizeof(kBackoffMs[0]);
 
 const char* const kSettingKeys[] = {"name", "server", "token", "talk_mode", "volume", "brightness", "screen_timeout", "battery_display", "battery_estimate", "language", "wifi_ssid", "wifi_pass",
                                     "face_down_sleep", "clock", "time_format", "touch_wake", "battery_alert", "battery_alert_sound", "charging_notice", "charging_sound", "charged_notice", "charged_sound", "double_home", "wake_talk", "touch_talk", "profile_grid", "wifi_deep_sleep",
-                                    "wake_word"};  // wake_word: only where App::wake_supported (known_setting)
+                                    "wake_word", "wake_gain", "wake_floor"};  // these three: only where App::wake_supported (known_setting)
+
+// A setting's number in [lo, hi], or nullopt for anything else ("", "abc", "nan", "1e9").
+std::optional<float> setting_number(const std::string& value, float lo, float hi) {
+  if (value.empty() || value.size() > 8) return std::nullopt;
+  char* end = nullptr;
+  const float v = std::strtof(value.c_str(), &end);
+  if (end != value.c_str() + value.size() || !(v >= lo && v <= hi)) return std::nullopt;
+  return v;
+}
 
 // NVS limits storage keys to 15 characters; keep the public setting name unchanged.
 std::string_view setting_storage_key(std::string_view key) {
@@ -249,6 +273,8 @@ void App::load_settings() {
   touch_talk_ = !profile_.talk_key || setting("touch_talk", "on") != "off";
   wifi_deep_sleep_ = setting("wifi_deep_sleep", "on") != "off";
   wake_word_ = wake_supported() && setting("wake_word", "off") == "on";
+  wake_gain_db_ = setting_number(setting("wake_gain"), 0, kWakeGainMaxDb).value_or(kWakeGainDb);
+  wake_floor_ = setting_number(setting("wake_floor"), kWakeFloorMinRms, kWakeFloorMaxRms).value_or(kWakeFloorRms);
   {
     const int grid = std::atoi(setting("profile_grid", "9").c_str());
     profile_grid_ = static_cast<uint8_t>(grid == 4 || grid == 6 || grid == 16 ? grid : 9);
@@ -1644,6 +1670,7 @@ void App::start_listening(bool hands_free, bool wake) {
   if (alarm_) dismiss_alarm();
   wake_pending_ = false;  // a press during a wake's beep takes over
   set_wake_armed(false);  // the detector lets go of the microphone first
+  set_mic_gain(wake);     // then the recording's gain, before its first chunk
   if (!hal_.mic || !hal_.mic->start(profile_.mic_rate)) {
     set_hint_flash(tr(i18n::Msg::MicUnavailable));
     return;
@@ -1662,6 +1689,10 @@ void App::start_listening(bool hands_free, bool wake) {
   Vad::Config vc;
   vc.sample_rate = profile_.mic_rate;
   vc.min_threshold = profile_.vad_min_rms;  // the board's microphone level
+  if (wake) {  // far-field, at the wake gain, after the microphone's start-up pop
+    vc.min_threshold = wake_floor_;
+    vc.ignore_ms = kWakeStartIgnoreMs;
+  }
   vad_.reset(vc);
   rec_on_ = rec_.ready();
   rec_.clear();
@@ -1696,6 +1727,7 @@ void App::send_mic_frame() {
 void App::finish_listening() {
   talk_key_armed_ = false;  // a recording on its way to Hermes is not one a second press can take back
   if (hal_.mic) hal_.mic->stop();
+  note_turn_level();
   if (rec_on_) {
     // audio.end goes once the link has taken all of the recording (pump_recording).
     rec_done_ = true;
@@ -1738,6 +1770,7 @@ void App::finish_listening() {
 
 void App::cancel_listening(std::string_view why) {
   if (hal_.mic) hal_.mic->stop();
+  note_turn_level();
   discard_recording();
   json::Value c = proto::message("audio.cancel");
   c.set("id", request_id_).set("stream", mic_stream_).set("reason", why);
@@ -1758,9 +1791,32 @@ bool App::wake_ready(bool speaker) const {
 
 void App::set_wake_armed(bool armed) {
   if (armed == wake_armed_ || !hal_.wake) return;
+  if (armed) set_mic_gain(true);  // before the detector's first chunk
   wake_armed_ = armed;
   hal_.wake->set_armed(armed);
   log(LogLevel::Debug, armed ? "wake word armed" : "wake word disarmed");
+}
+
+void App::set_mic_gain(bool wake) {
+  if (!hal_.mic || !wake_supported()) return;
+  const std::optional<float> db = wake ? std::optional<float>(wake_gain_db_) : std::nullopt;
+  if (db == mic_gain_) return;
+  mic_gain_ = db;
+  hal_.mic->set_gain_db(db);
+}
+
+void App::note_turn_level() {
+  if (!hands_free_) return;  // no VAD ran
+  const VadLevel l = vad_.level();
+  if (wake_turn_) wake_last_turn_ = l;
+  char gain[32] = "";
+  if (wake_turn_) std::snprintf(gain, sizeof gain, ", wake_gain %.1f dB", static_cast<double>(wake_gain_db_));
+  char line[176];
+  std::snprintf(line, sizeof line, "%s turn: %s, %u ms of speech blocks, block RMS mean %.0f max %.0f, peak %d (floor %.0f%s)",
+                wake_turn_ ? "wake" : "tap", l.speech ? "heard speech" : "no speech", static_cast<unsigned>(l.speech_ms),
+                static_cast<double>(l.rms_mean), static_cast<double>(l.rms_max), l.peak,
+                static_cast<double>(wake_turn_ ? wake_floor_ : profile_.vad_min_rms), gain);
+  log(LogLevel::Info, line);
 }
 
 void App::wake_tick() {
@@ -2481,6 +2537,8 @@ void App::update_model() {
   // tick doesn't start a turn. Arming again waits for wake_tick().
   if (wake_pending_ && !wake_ready(false)) drop_pending_wake("taken over");
   if (wake_armed_ && !wake_ready(true)) set_wake_armed(false);
+  // The wake gain lasts while armed, through a wake's beep and its turn; then the board's again.
+  set_mic_gain(wake_armed_ || wake_pending_ || (mode_ == Mode::Listening && wake_turn_));
   UiModel& m = model_;
   // A recording held through a lost connection keeps its screen over the connecting ones.
   const bool held = recording_held() && (mode_ == Mode::Listening || mode_ == Mode::Thinking);
@@ -2937,7 +2995,7 @@ std::string App::diag_report() {
 }
 
 bool App::known_setting(std::string_view key) const {
-  if (key == "wake_word") return wake_supported();
+  if (key == "wake_word" || key == "wake_gain" || key == "wake_floor") return wake_supported();
   for (const char* k : kSettingKeys) {
     if (key == k) return true;
   }
@@ -3006,7 +3064,11 @@ std::string App::console(std::string_view raw) {
     std::string key = rest.substr(0, ks);
     if (!known_setting(key)) return "@error unknown key";
     if (cmd == "get") {
-      std::string v = key == "wake_word" ? setting(key, "off") : setting(key);
+      // The wake word's settings say what they are when unset (load_settings' defaults).
+      std::string v = key == "wake_word"    ? setting(key, "off")
+                      : key == "wake_gain"  ? setting(key, json::Value(static_cast<double>(kWakeGainDb)).dump())
+                      : key == "wake_floor" ? setting(key, json::Value(static_cast<double>(kWakeFloorRms)).dump())
+                                            : setting(key);
       json::Value out = json::Value::object();
       out.set("key", key).set("value", is_secret(key) && !v.empty() ? std::string("<set>") : v);
       return "@value " + out.dump();
@@ -3044,6 +3106,10 @@ std::string App::console(std::string_view raw) {
       return "@error touch_talk must be on or off";
     if (key == "wake_word" && !value.empty() && value != "on" && value != "off")
       return "@error wake_word must be on or off";
+    if (key == "wake_gain" && !value.empty() && !setting_number(value, 0, kWakeGainMaxDb))
+      return "@error wake_gain must be 0..37.5 dB";
+    if (key == "wake_floor" && !value.empty() && !setting_number(value, kWakeFloorMinRms, kWakeFloorMaxRms))
+      return "@error wake_floor must be 30..3000 (RMS)";
     if (key == "wifi_deep_sleep" && !value.empty() && value != "on" && value != "off")
       return "@error wifi_deep_sleep must be on or off";
     if (key == "profile_grid" && !value.empty() && value != "4" && value != "6" && value != "9" && value != "16")
