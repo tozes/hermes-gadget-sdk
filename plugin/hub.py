@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from . import audio, opus, protocol
+from . import audio, opus, protocol, textfmt
 from .face import ColourFace, ProfileFace
 from .store import DeviceStore
 
@@ -40,8 +40,14 @@ MAX_PENDING_DEVICES = 16     # unapproved devices the store keeps, in total...
 MAX_PENDING_PER_ADDRESS = 4  # ...and from one network address
 
 
-def short_utterance_notice(session: "DeviceSession") -> str:
-    """The retry hint, worded for how this device takes speech."""
+def short_utterance_notice(session: "DeviceSession", wake: bool = False) -> str:
+    """The retry hint, worded for how this device takes speech; ``wake``: the turn began with the wake word."""
+    if wake:
+        caps = session.caps.get("wake")
+        phrase = caps.get("phrase") if isinstance(caps, dict) else None
+        if isinstance(phrase, str) and phrase.strip():
+            return textfmt.for_device(f"Didn't catch that - say “{phrase.strip()}” and speak", session.charset)
+        return "Didn't catch that - tap and speak"
     if "touch" in (session.caps.get("inputs") or []):
         return ("Didn't catch that - tap and speak" if session.caps.get("talk_mode") == "tap"
                 else "Didn't catch that - hold the screen while speaking")
@@ -129,6 +135,7 @@ class _Upload:
     next_seq: int = 0
     gaps: int = 0
     truncated: bool = False
+    wake: bool = False  # started by the device's wake word (audio.start "mode": "wake")
 
 
 @dataclass
@@ -1130,9 +1137,14 @@ class DeviceHub:
         if not 4000 <= rate <= 48000:
             await session.send_notice(f"Unsupported sample rate {rate}")
             return
+        wake = msg.get("mode") == "wake"
         session._upload = _Upload(
-            id=str(msg.get("id") or ""), stream=int(msg.get("stream") or 0), rate=rate, started=time.monotonic())
+            id=str(msg.get("id") or ""), stream=int(msg.get("stream") or 0), rate=rate, started=time.monotonic(),
+            wake=wake)
         _note(session, state="listening", heard="", reply="", status="")
+        if wake:
+            # Treated like a tap turn; only the retry hint differs.
+            log.info("device %s: recording %s started by the wake word", session.device_id, session._upload.id)
         resent = msg.get("resent")
         if isinstance(resent, int) and resent > 0:
             # Recorded through a lost connection and sent whole now, as fast as the link takes it.
@@ -1164,7 +1176,7 @@ class DeviceHub:
         seconds = audio.duration_s(bytes(up.pcm), up.rate) if up is not None else 0.0
         if up is None or seconds < MIN_UTTERANCE_S:
             # An empty-id turn.end settles the device; without it the device waits on "Sending..." for minutes.
-            await session.send_notice(short_utterance_notice(session))
+            await session.send_notice(short_utterance_notice(session, wake=up is not None and up.wake))
             await session.turn_end("", outcome="cancelled")
             return
         wav = audio.wav_bytes(bytes(up.pcm), up.rate)

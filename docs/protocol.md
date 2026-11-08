@@ -70,6 +70,7 @@ Because the id is derived from the key, nobody can claim another device's id wit
 - `caps.speaker.formats` (`["pcm16", "opus"]`) lists the speaker audio formats the device decodes. `format` stays `"pcm16"` for servers that predate the list, and PCM16 is always accepted. See [Audio to the device](#audio-to-the-device).
 - `caps.speaker.buffer_ms` (`4096`) is how much reply audio, in milliseconds, the device can hold before it plays it. The server then sends audio further ahead of real time, which keeps playback smooth on a link whose delay varies, such as a phone hotspot. It is optional: without it the server keeps its default lead. See [Audio to the device](#audio-to-the-device).
 - `caps.ota` (`{"max_size": 2031616}`) means the device installs firmware updates over this connection, up to `max_size` bytes.
+- `caps.wake` (`{"phrase": "Hey Hermes"}`) means the device can start a turn when it hears its wake word, `phrase`. Such a turn's `audio.start` carries `"mode": "wake"`; see [Conversation](#conversation). A device without a wake word omits `wake`.
 - `caps.dashboard` (`{"v": 1, "rows": 6}`) means the device draws the [dashboard](#dashboard). `v` is the newest layout it draws, and `rows` is how many lines fit on its screen at once.
 - `actions` is the device's tool manifest. Each action has a JSON-Schema `params` object and a `description` written for the model.
 - `caps.profiles: true` means the device can switch Hermes profiles (see [Profiles](#profiles)). `profile` is the profile it used last; it is omitted for `default`.
@@ -210,6 +211,7 @@ The Hermes plugin makes a profile's thumbnail from its `gadget-face.bin` (the id
 
 - Utterances shorter than 0.25 s are dropped with a `notice`, and the server then sends a `turn.end` with an empty `turn` and outcome `cancelled`, so the device stops waiting.
 - A device may send a recording again after a lost connection, on the new connection and on a new `stream`, with the same `id`. Its `audio.start` then carries `"resent": 1` (how many times it was sent again) and `"age_ms"` (how long ago the recording began). Its frames arrive faster than real time. A server assembles an utterance by stream whatever the pace, so these fields are informational: the reference hub logs them, and older hubs ignore them.
+- `mode` says how the user started the utterance: `hold` (held the talk control), `tap` (tapped it) or `wake` (said the wake word the device names in `caps.wake`). Frames, `audio.end`, `audio.cancel` and resends are the same in every mode. A server treats a `wake` utterance like a `tap` one; the reference hub logs it and, when the utterance is too short, words its `notice` for the wake phrase. Older hubs ignore `mode`.
 - The server caps an utterance at `max_utterance_s` (60 s by default).
 
 ### Server → device
